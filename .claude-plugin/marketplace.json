@@ -1,0 +1,11 @@
+{
+  "name": "branchling",
+  "owner": { "name": "Branchling" },
+  "plugins": [
+    {
+      "name": "branchling",
+      "source": "./plugin",
+      "description": "Turns tests, builds, commits and merges in a linked project into one-line almanac entries for the Branchling app."
+    }
+  ]
+}
