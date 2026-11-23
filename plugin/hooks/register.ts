@@ -1244,7 +1244,7 @@ async function phoneCommand($: EngineInterface, h: string, rest: string): Promis
   if (arg === 'off') {
     await $.fs.write(cloudFile(h), '{}\n')
     await $.fs.write(sentFile(h), '{}\n')
-    return 'This computer no longer writes the almanac into your iCloud. What is already there stays until you remove it on the iPhone. (With a Mac, the Branchling Mac app sends it on its own.)'
+    return 'This computer no longer writes the almanac into your iCloud. What is already there stays; to remove it, on the iPhone open Settings › your name › iCloud › Manage Account Storage › Branchling › Delete Data. (With a Mac, the Branchling Mac app sends it while it is open.)'
   }
   const c = await readCloud($, h)
   if (!c) {
@@ -1438,11 +1438,27 @@ export const register: Register = on => {
     if (sub === 'phone') return { text: await phoneCommand($, h, rest) }
 
     if (sub === 'off') {
-      const root = (await gitRoot($, cwd)) ?? cwd
-      if (await $.fs.exists(`${root}/.branchling.json`)) return { text: `This folder is linked by ${root}/.branchling.json; delete that file to leave Branchling.` }
-      await setLink($, h, root, null)
+      // "/branchling off" (this folder), "/branchling off ~/Projects/app" (a folder) or "/branchling off ortak-masa" (every folder of a project).
+      let roots: string[]
+      if (rest && !/^[~/.]/.test(rest)) {
+        const name = slug(rest)
+        const links = await readLinks($, h)
+        roots = Object.keys(links).filter(r => links[r] === name)
+        if (!roots.length) return { text: `No folder records into "${name}".` }
+      } else {
+        const dir = rest ? resolvePath(cwd, rest, h) : cwd
+        const root = (await gitRoot($, dir)) ?? dir
+        if (root === h) return { text: 'This is your home folder. Name what to stop: /branchling off <folder> or /branchling off <project name>' }
+        roots = [root]
+      }
+      for (const root of roots) {
+        if (await $.fs.exists(`${root}/.branchling.json`)) return { text: `${root} is linked by ${root}/.branchling.json; delete that file to leave Branchling.` }
+        await setLink($, h, root, null)
+        for (const [k, p] of workedIn) if (p.root === root) workedIn.delete(k)
+        if (lastWorked?.root === root) lastWorked = null
+      }
       await refresh($)
-      return { text: `${root} no longer joins the almanac. What was recorded stays; to join again: /branchling link <name>` }
+      return { text: `${roots.join(', ')} no longer recorded. What was recorded stays in the app; to record again: /branchling link <name> <folder>` }
     }
 
     if (sub === 'plan' && !rest) {

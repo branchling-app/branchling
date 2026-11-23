@@ -15,7 +15,7 @@ The plugin has no server and never calls a model by itself: the almanac is a fol
 ## Get started
 
 1. Install the plugin in Claude Code.
-2. Work as usual. Every git project you open in Claude Code joins the almanac by itself, named after its folder. `/branchling off` leaves the current project out; `/branchling link <name>` gives it another name.
+2. Work as usual. A git repository joins the almanac by itself, named after its folder, as soon as Claude Code tests, builds, commits or edits files in it (not merely because a session was opened there). `/branchling off` leaves a project out; `/branchling link <name> <folder>` gives it another name or adds a second repository to one project.
 3. Run `/branchling plan`. Claude reads the repository and writes the goal (one sentence) and the road ahead (sized tasks, S, M or L).
 
 From then on the almanac fills itself as you and Claude work:
@@ -32,10 +32,10 @@ Once a day, at a quiet moment and only when something happened, Claude refreshes
 | Command | What it does |
 | --- | --- |
 | `/branchling` | Today's score, open problems and the plan in one glance |
-| `/branchling link <name>` | Names this project's almanac (projects join by themselves) |
-| `/branchling off` | Leaves this project out of the almanac |
+| `/branchling link <name> [folder]` | Records a folder (this one if left out) into the project `<name>`; several folders can share one project |
+| `/branchling off [folder \| name]` | Stops recording a folder, or every folder of a project; what was recorded stays |
 | `/branchling phone [now \| off]` | Shows the iPhone connection (computers without Branchling for Mac), sends now, or stops it |
-| `/branchling plan` | Asks Claude to write or refresh the goal and plan |
+| `/branchling plan [folder \| name]` | Asks Claude to write or refresh the goal and plan; when the session worked in several projects it asks which |
 | `/branchling goal <sentence>` | Sets the goal yourself (90 characters at most); Claude keeps it |
 | `/branchling tasks` | Lists the planned tasks and their status |
 | `/branchling progress <text>` | Records progress by hand (also `problem` and `hold`) |
@@ -58,3 +58,12 @@ The Branchling iPhone app asks where you use Claude Code and shows one sentence.
 ```
 
 Delete a project's folder and it is gone. The Mac app reads the same folder; to rename or delete a project there, right-click it in the sidebar.
+
+## Disconnecting and uninstalling
+
+- **Stop recording a project:** `/branchling off <name>`, or in the Mac app right-click the project › Folders… › ✕. Deleting the project in the Mac app also stops it.
+- **Stop sending to the iPhone:** without a Mac, `/branchling phone off`; with a Mac, quit Branchling for Mac (it only sends while open).
+- **Remove what is in iCloud:** on the iPhone, Settings › your name › iCloud › Manage Account Storage › Branchling › Delete Data (on a Mac: System Settings › your name › iCloud › Manage). Only your devices can open it anyway.
+- **Uninstall the plugin:** `claude plugin uninstall branchling@branchling`, then `claude plugin marketplace remove branchling`. Nothing else is left running.
+- **Remove the local almanac too:** delete the `~/.branchling` folder.
+- **Cloud sessions:** in each repository that has it, delete `.claude/branchling/`, remove the two Branchling hooks from `.claude/settings.json`, and delete the repository's `branchling` branch.
