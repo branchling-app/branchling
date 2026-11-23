@@ -225,7 +225,10 @@ const joined = new Map<string, Project | null>()
 async function readLinks($: EngineInterface, h: string): Promise<Record<string, string | null>> {
   try {
     const j = JSON.parse(await $.fs.read(linksFile(h)))
-    return j && typeof j === 'object' ? j : {}
+    if (!j || typeof j !== 'object') return {}
+    // Branchling's own folder is never a project's code (a folder picked there by mistake records nothing).
+    for (const k of Object.keys(j)) if (k === `${h}/.branchling` || k.startsWith(`${h}/.branchling/`)) delete j[k]
+    return j
   } catch {
     return {}
   }
@@ -1470,6 +1473,7 @@ export const register: Register = on => {
       const g = await $.process.run(['git', '-C', dir, 'rev-parse', '--show-toplevel'])
       const root = g.exitCode === 0 && g.stdout.trim() ? g.stdout.trim() : dir
       if (root === h) return { text: 'This is your home folder. Name the project folder: /branchling link <name> <folder>' }
+      if (root === `${h}/.branchling` || root.startsWith(`${h}/.branchling/`)) return { text: 'That is Branchling\'s own folder, where the almanac is kept. Name the folder of the project\'s code: /branchling link <name> <folder>' }
       const project = slug(words.join(' ')) || 'project'
       const aliases = await readAliases($, h)
       if (project in aliases) {
