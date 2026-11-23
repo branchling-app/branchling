@@ -1470,6 +1470,11 @@ export const register: Register = on => {
         text:
           `Write the Branchling plan for the project "${pr.project}" in ${pr.root}. Call the Branchling plan tool (mcp__…__plan, load it with ToolSearch \"branchling plan\" if it is not loaded) with action "read" and project "${pr.root}", ` +
           `look at that repository only as much as you need, then call it with action "write", project "${pr.root}" and the whole plan. ` +
+          (await (async () => {
+            const links = await readLinks($, h)
+            const others = Object.keys(links).filter(r => links[r] === pr.project && r !== pr.root)
+            return others.length ? `The project spans more folders, all one plan: ${others.join(', ')}; look at them too as far as the plan needs. ` : ''
+          })()) +
           (rest
             ? ''
             : `Branchling chose ${pr.root} ${guessed ? 'only because this session was opened there' : 'because it is the only project this session worked in'}. ` +
