@@ -1201,12 +1201,62 @@ async function sendProject($: EngineInterface, h: string, c: Cloud, project: str
 }
 
 /** Carries cloud-session entries in, then (on the other way) sends the project to iCloud. Returns files sent. */
+let deletesAsked = 0
+
+/**
+ * Projects deleted on the iPhone (no Mac app here): the iPhone leaves their names in iCloud. A project on this computer
+ * is deleted as the Mac's Delete does: its folder goes to the Trash, its folders stop recording, its records leave
+ * iCloud. Names this computer does not have stay for another one. Looked at every few minutes at most.
+ */
+async function takeDeleteRequests($: EngineInterface, h: string, c: Cloud) {
+  if (Date.now() - deletesAsked < 3 * 60_000) return
+  deletesAsked = Date.now()
+  const name = recordName('requests/delete')
+  const j = await cloudCall($, h, c, 'records/lookup', { zoneID: { zoneName: 'Almanac' }, records: [{ recordName: name }] })
+  const rec = (j.records ?? [])[0]
+  if (!rec || rec.serverErrorCode) return
+  let names: string[] = []
+  try {
+    names = JSON.parse(new TextDecoder().decode(fromBase64(rec.fields?.body?.value ?? '')))
+  } catch {
+    return
+  }
+  if (!Array.isArray(names) || !names.length) return
+  const done: string[] = []
+  for (const n of names) {
+    if (typeof n !== 'string' || !/^[a-z0-9][a-z0-9-]*$/.test(n) || !(await $.fs.exists(projectDir(h, n)))) continue
+    const trash = (await $.fs.exists(`${h}/.Trash`)) ? `${h}/.Trash` : `${h}/.branchling/trash`
+    await $.process.run(['mkdir', '-p', trash])
+    const mv = await $.process.run(['mv', projectDir(h, n), `${trash}/${n} ${new Date().toISOString().slice(0, 16).replace(':', '.')}`])
+    if (mv.exitCode !== 0) continue
+    const aliases = await readAliases($, h)
+    for (const [k, v] of Object.entries(aliases)) if (v === n) aliases[k] = null
+    aliases[n] = null
+    await $.fs.write(`${h}/.branchling/aliases.json`, JSON.stringify(aliases, null, 2) + '\n')
+    const links = await readLinks($, h)
+    for (const [root, p] of Object.entries(links)) if (p === n) await setLink($, h, root, null)
+    for (const [k, p] of workedIn) if (p.project === n) workedIn.delete(k)
+    if (lastWorked?.project === n) lastWorked = null
+    await sendProject($, h, c, n)
+    done.push(n)
+  }
+  if (!done.length) return
+  const rest = names.filter(n => !done.includes(n))
+  const op = rest.length
+    ? { operationType: 'update', record: { recordName: name, recordType: 'AlmanacFile', recordChangeTag: rec.recordChangeTag,
+        fields: { path: { value: 'requests/delete', type: 'STRING' }, body: { value: toBase64(new TextEncoder().encode(JSON.stringify(rest))), type: 'BYTES' } } } }
+    : { operationType: 'forceDelete', record: { recordName: name } }
+  await cloudCall($, h, c, 'records/modify', { zoneID: { zoneName: 'Almanac' }, atomic: false, operations: [op] })
+}
+
 async function syncProject($: EngineInterface, pr: Project): Promise<number> {
   const h = await homeDir($)
   await carryCloud($, h, pr)
   const c = await readCloud($, h)
   if (!c || c.broken) return 0
   try {
+    await takeDeleteRequests($, h, c).catch(() => undefined)
+    if (!(await $.fs.exists(projectDir(h, pr.project)))) return 0
     return await sendProject($, h, c, pr.project)
   } catch (err: any) {
     if (err?.auth || err?.webOff) {
