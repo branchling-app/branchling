@@ -1,7 +1,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 import { fromBase64, seal, toBase64 } from './seal'
 
-// Branchling: turns what happens in a linked project (.branchling.json) into one-line entries,
+// Branchling: turns what happens in a linked project (~/.branchling/links.json) into one-line entries,
 // and keeps the project's goal and plan, written by the user's own Claude through the `plan` tool.
 // The plugin itself never calls a model. Everything stays on this machine:
 //   ~/.branchling/projects/<project>/entries/<YYYY-MM-DD>.jsonl   entries (plugin)
@@ -161,18 +161,15 @@ function resolveAlias(aliases: Record<string, string | null>, name: string): str
 /** The project a folder records into. An unlinked repository joins only with `join`: when real work happens there
  * (a test, build, commit or merge, or an edited file) or the person names it, never because a session opened in it. */
 async function findProject($: EngineInterface, dir: string, join = false): Promise<Project | null> {
-  const found = (await findLink($, dir)) ?? (join ? await joinOnce($, dir) : null)
+  const link = await findLink($, dir)
+  if (link === null) return null // turned off for this folder
+  const found = link ?? (join ? await joinOnce($, dir) : null)
   if (!found) return null
   const h = await homeDir($)
   const project = resolveAlias(await readAliases($, h), found.project)
   if (project === null) return null
-  if (project !== found.project) {
-    try {
-      await $.fs.write(`${found.root}/.branchling.json`, JSON.stringify({ project }, null, 2) + '\n')
-    } catch {
-      // read-only checkout: the alias keeps working
-    }
-  }
+  // A rename made in the app: the link follows it (in ~/.branchling, never in the repository).
+  if (project !== found.project) await setLink($, h, found.root, project)
   return { root: found.root, project }
 }
 
@@ -218,7 +215,8 @@ function notHere(cwd: string): string {
 
 // Projects join by themselves: the first time Claude Code works in a git repository, it gets an almanac named after
 // its folder. ~/.branchling/links.json keeps the choice per repository root ({ "<root>": "<project>" | null });
-// null is /branchling off. An older .branchling.json in the repository still wins.
+// null is /branchling off. Branchling never writes into a repository: an older .branchling.json left there by an early
+// version is read once, moved into links.json, and from then on links.json decides.
 const linksFile = (h: string) => `${h}/.branchling/links.json`
 const joined = new Map<string, Project | null>()
 
@@ -273,23 +271,41 @@ async function joinOnce($: EngineInterface, dir: string): Promise<Project | null
   return found
 }
 
-async function findLink($: EngineInterface, dir: string): Promise<Project | null> {
+/**
+ * The linked folder that holds `dir`: a project, null when it was turned off, undefined when it is not linked.
+ * links.json first (the innermost linked folder wins); then an older .branchling.json, moved into links.json.
+ */
+async function findLink($: EngineInterface, dir: string): Promise<Project | null | undefined> {
+  const h = await homeDir($)
+  const links = await readLinks($, h)
+  let best: string | undefined
+  for (const r of Object.keys(links)) {
+    if ((dir === r || dir.startsWith(r + '/')) && (!best || r.length > best.length)) best = r
+  }
+  if (best !== undefined) {
+    const p = links[best]
+    return p ? { root: best, project: p } : null
+  }
   let d = dir
   for (let i = 0; i < 40; i++) {
     const f = (d === '/' ? '' : d) + '/.branchling.json'
-    if (await $.fs.exists(f)) {
+    if (d !== h && (await $.fs.exists(f))) {
       try {
         const j = JSON.parse(await $.fs.read(f))
-        if (j && typeof j.project === 'string' && j.project) return { root: d, project: slug(j.project) || 'project' }
+        if (j && typeof j.project === 'string' && j.project) {
+          const project = slug(j.project) || 'project'
+          await setLink($, h, d, project)
+          return { root: d, project }
+        }
       } catch {
-        // unreadable link file: stay quiet
+        // unreadable link file: not linked
       }
-      return null
+      return undefined
     }
-    if (d === '/') return null
+    if (d === '/') return undefined
     d = d.slice(0, d.lastIndexOf('/')) || '/'
   }
-  return null
+  return undefined
 }
 
 const projectDir = (h: string, project: string) => `${h}/.branchling/projects/${project}`
@@ -1350,11 +1366,7 @@ async function branchlingCommand($: EngineInterface, e: { args?: string }): Prom
       delete aliases[project]
       await $.fs.write(`${h}/.branchling/aliases.json`, JSON.stringify(aliases, null, 2) + '\n')
     }
-    if (await $.fs.exists(`${root}/.branchling.json`)) {
-      await $.fs.write(`${root}/.branchling.json`, JSON.stringify({ project }, null, 2) + '\n')
-    } else {
-      await setLink($, h, root, project)
-    }
+    await setLink($, h, root, project)
     await refresh($)
     return { text: `${root} is now linked to the "${project}" almanac. Tests, builds, commits and merges there are recorded automatically. Next: /branchling plan ${dirWord ? project : ''}`.trimEnd() }
   }
@@ -1376,7 +1388,6 @@ async function branchlingCommand($: EngineInterface, e: { args?: string }): Prom
       roots = [root]
     }
     for (const root of roots) {
-      if (await $.fs.exists(`${root}/.branchling.json`)) return { text: `${root} is linked by ${root}/.branchling.json; delete that file to leave Branchling.` }
       await setLink($, h, root, null)
       for (const [k, p] of workedIn) if (p.root === root) workedIn.delete(k)
       if (lastWorked?.root === root) lastWorked = null

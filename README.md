@@ -25,6 +25,8 @@ From then on the almanac fills itself as you and Claude work:
 - **Merges.** A merged branch curves back into the trunk and stops speaking for the project.
 - **Approvals.** When Claude stops for your OK it can record the question with the `ask` tool, and closes it once you answer.
 
+**Claude usage is yours.** Branchling includes no Claude usage. Writing and refreshing the plan is Claude's work in your Claude Code session, on your own Claude subscription or API account. Recording runs on your computer without Claude and only adds a short note about the plan to Claude's context.
+
 Once a day, at a quiet moment and only when something happened, Claude refreshes the plan in your session. Turn this off in `~/.branchling/settings.json` (`{ "autoRefresh": false }`) or in the app's settings.
 
 ## Commands
