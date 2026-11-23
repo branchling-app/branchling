@@ -45,6 +45,8 @@ Once a day, at a quiet moment and only when something happened, Claude refreshes
 | `/branchling open` | Lists what is still waiting: open problems, approvals and holds |
 | `/branchling usage` | Claude tokens and turns spent in this project over the last week |
 
+A `/branchling` command typed while Claude is still working reaches Claude as plain text; Claude then runs it for you with the plugin's `command` tool.
+
 ## On your iPhone
 
 The Branchling iPhone app asks where you use Claude Code and shows one sentence. Paste it into Claude Code and Claude sets everything up: on a computer it installs this plugin (and, without Branchling for Mac, keeps an iCloud token for it); in Claude Code on the web it adds a small recorder to the repository, whose sealed entries your computer passes on later. Details in [SETUP.md](SETUP.md).

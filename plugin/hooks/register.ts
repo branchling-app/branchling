@@ -753,6 +753,14 @@ const ASK_SCHEMA = {
   required: ['action'],
 } as const
 
+const COMMAND_TOOL_DESC = `Runs a /branchling command for the user, such as "off lupeo", "link Lupeo ~/Projects/lupeo-app", "phone off" or "usage".
+Use it when the user's message is a /branchling command that reached you as text (typed while you were busy) or when they ask you to run one. Pass what follows "/branchling" as args.`
+const COMMAND_SCHEMA = {
+  type: 'object',
+  properties: { args: { type: 'string', description: 'What follows /branchling, e.g. "off lupeo"' } },
+  required: ['args'],
+} as const
+const isCommandTool = (name: string) => name === 'mcp__branchling__command'
 const isAskTool = (name: string) => name === 'mcp__branchling__ask' || name === 'mcp__almanak__ask'
 
 const PLAN_SCHEMA = {
@@ -1323,11 +1331,12 @@ export const register: Register = on => {
     await $.command.register({
       name: 'branchling',
       description: "This project's almanac: today, goal and plan, open problems, manual entries, linking",
-      argumentHint: '[plan | phone [now | off] | off | goal <sentence> | tasks | usage | link <name> | progress|problem|hold <text> | ask <text> | approve <no> | solve <no> <text> | open]',
+      argumentHint: '[plan | phone [now | off] | off [folder | name] | goal <sentence> | tasks | usage | link <name> [folder] | progress|problem|hold <text> | ask <text> | approve <no> | solve <no> <text> | open]',
     })
     try {
       await $.tool.register({ name: 'plan', description: PLAN_TOOL_DESC, inputSchema: PLAN_SCHEMA })
       await $.tool.register({ name: 'ask', description: ASK_TOOL_DESC, inputSchema: ASK_SCHEMA })
+      await $.tool.register({ name: 'command', description: COMMAND_TOOL_DESC, inputSchema: COMMAND_SCHEMA })
     } catch {
       // the almanac still works without the tool
     }
@@ -1356,6 +1365,16 @@ export const register: Register = on => {
   // Answered at tool.call: the tool only reads and writes Branchling's own files under ~/.branchling.
   on('tool.call', async ($, e, next) => {
     if (isAskTool(e.tool)) return handleAsk($, e)
+    if (isCommandTool(e.tool)) {
+      const args = String((e as unknown as { args?: unknown }).args ?? '').replace(/^\/?branchling\s*/, '').trim()
+      if (/^plan\b/.test(args)) return { deny: 'For the plan, read the project and call the plan tool yourself.' }
+      try {
+        const r = await branchlingCommand($, { args })
+        return { result: typeof r?.text === 'string' ? r.text : 'Done.' }
+      } catch (err: any) {
+        return { deny: `Branchling: ${err?.message ?? err}` }
+      }
+    }
     if (!isPlanTool(e.tool)) {
       const file = (e as unknown as { file_path?: unknown }).file_path
       if ((e.tool === 'Edit' || e.tool === 'Write') && typeof file === 'string' && file.startsWith('/')) {
@@ -1457,7 +1476,8 @@ export const register: Register = on => {
     return ran
   })
 
-  on('command.run', { command: 'branchling' }, async ($, e) => {
+  // The /branchling command; the command tool runs the same when the person typed it while Claude was busy.
+  const branchlingCommand = async ($: EngineInterface, e: { args?: string }): Promise<any> => {
     const h = await homeDir($)
     const cwd = await $.session.cwd()
     const [sub = '', ...restParts] = (e.args ?? '').trim().split(/\s+/)
@@ -1665,5 +1685,6 @@ export const register: Register = on => {
     return {
       text: `${head}Branchling · ${pr.project}: today ${signed(day)}, momentum ${signed(total)} (${es.length} entries)\n${list}\nOpen problems:\n${openText}\n\nPlan: /branchling plan · Tasks: /branchling tasks · Claude usage: /branchling usage · Manual: /branchling progress|problem|hold <text> · Solve: /branchling solve <no> <text>`,
     }
-  })
+  }
+  on('command.run', { command: 'branchling' }, ($, e) => branchlingCommand($, e))
 }
