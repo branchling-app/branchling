@@ -1326,6 +1326,217 @@ async function phoneCommand($: EngineInterface, h: string, rest: string): Promis
 
 // ---------- Hooks ----------
 
+// The /branchling command; the command tool runs the same when the person typed it while Claude was busy.
+async function branchlingCommand($: EngineInterface, e: { args?: string }): Promise<any> {
+  const h = await homeDir($)
+  const cwd = await $.session.cwd()
+  const [sub = '', ...restParts] = (e.args ?? '').trim().split(/\s+/)
+  const rest = restParts.join(' ').trim()
+
+  if (sub === 'link') {
+    if (!rest) return { text: 'Usage: /branchling link <project name> [folder]' }
+    // "/branchling link Ortak Masa ~/Projects/katilim-app": a last word that is a path names the folder.
+    const words = rest.split(/\s+/)
+    const dirWord = words.length > 1 && /^[~/.]/.test(words[words.length - 1] ?? "") ? words.pop() : undefined
+    const dir = dirWord ? resolvePath(cwd, dirWord, h) : cwd
+    if (dirWord && !(await $.fs.exists(dir))) return { text: `${dir} does not exist.` }
+    const g = await $.process.run(['git', '-C', dir, 'rev-parse', '--show-toplevel'])
+    const root = g.exitCode === 0 && g.stdout.trim() ? g.stdout.trim() : dir
+    if (root === h) return { text: 'This is your home folder. Name the project folder: /branchling link <name> <folder>' }
+    if (root === `${h}/.branchling` || root.startsWith(`${h}/.branchling/`)) return { text: 'That is Branchling\'s own folder, where the almanac is kept. Name the folder of the project\'s code: /branchling link <name> <folder>' }
+    const project = slug(words.join(' ')) || 'project'
+    const aliases = await readAliases($, h)
+    if (project in aliases) {
+      delete aliases[project]
+      await $.fs.write(`${h}/.branchling/aliases.json`, JSON.stringify(aliases, null, 2) + '\n')
+    }
+    if (await $.fs.exists(`${root}/.branchling.json`)) {
+      await $.fs.write(`${root}/.branchling.json`, JSON.stringify({ project }, null, 2) + '\n')
+    } else {
+      await setLink($, h, root, project)
+    }
+    await refresh($)
+    return { text: `${root} is now linked to the "${project}" almanac. Tests, builds, commits and merges there are recorded automatically. Next: /branchling plan ${dirWord ? project : ''}`.trimEnd() }
+  }
+
+  if (sub === 'phone') return { text: await phoneCommand($, h, rest) }
+
+  if (sub === 'off') {
+    // "/branchling off" (this folder), "/branchling off ~/Projects/app" (a folder) or "/branchling off ortak-masa" (every folder of a project).
+    let roots: string[]
+    if (rest && !/^[~/.]/.test(rest)) {
+      const name = slug(rest)
+      const links = await readLinks($, h)
+      roots = Object.keys(links).filter(r => links[r] === name)
+      if (!roots.length) return { text: `No folder records into "${name}".` }
+    } else {
+      const dir = rest ? resolvePath(cwd, rest, h) : cwd
+      const root = (await gitRoot($, dir)) ?? dir
+      if (root === h) return { text: 'This is your home folder. Name what to stop: /branchling off <folder> or /branchling off <project name>' }
+      roots = [root]
+    }
+    for (const root of roots) {
+      if (await $.fs.exists(`${root}/.branchling.json`)) return { text: `${root} is linked by ${root}/.branchling.json; delete that file to leave Branchling.` }
+      await setLink($, h, root, null)
+      for (const [k, p] of workedIn) if (p.root === root) workedIn.delete(k)
+      if (lastWorked?.root === root) lastWorked = null
+    }
+    await refresh($)
+    return { text: `${roots.join(', ')} no longer recorded. What was recorded stays in the app; to record again: /branchling link <name> <folder>` }
+  }
+
+  if (sub === 'plan' && !rest) {
+    const many = whichOne()
+    if (many) return { text: many }
+  }
+  let found = await projectFor($, h, cwd, sub === 'plan' ? rest : undefined)
+  if (typeof found === 'string') return { text: found }
+  let guessed = false
+  if (!found && sub === 'plan') {
+    const root = await gitRoot($, cwd)
+    if (root && root !== h) {
+      found = { root, project: slug(root.split('/').pop() ?? '') || 'project' }
+      guessed = true
+    }
+  }
+  if (!found) return { text: notHere(cwd) }
+  const pr = found
+  const es = await readAll($, h, pr.project)
+  const open = openProblems(es)
+
+  if (sub === 'plan') {
+    // A command can't submit while it holds the turn: queue the prompt just after it answers.
+    const ask = {
+      text:
+        `Write the Branchling plan for the project "${pr.project}" in ${pr.root}. Call the Branchling plan tool (mcp__…__plan, load it with ToolSearch \"branchling plan\" if it is not loaded) with action "read" and project "${pr.root}", ` +
+        `look at that repository only as much as you need, then call it with action "write", project "${pr.root}" and the whole plan. ` +
+        (await (async () => {
+          const links = await readLinks($, h)
+          const others = Object.keys(links).filter(r => links[r] === pr.project && r !== pr.root)
+          return others.length ? `The project spans more folders, all one plan: ${others.join(', ')}; look at them too as far as the plan needs. ` : ''
+        })()) +
+        (rest
+          ? ''
+          : `Branchling chose ${pr.root} ${guessed ? 'only because this session was opened there' : 'because it is the only project this session worked in'}. ` +
+            `If this conversation is working on a different project, use that project's folder as "project" instead; ` +
+            `if that project has no git repository yet, write nothing and tell the user to run "git init" in its folder, then /branchling plan <folder>. `) +
+        `${languageRule((await settings($, h)).language)} ` +
+        `Finish with the goal sentence and the progress in one line.`,
+    }
+    $.clock.after(50, () => {
+      $.prompt.submit(ask).catch(() => $.ui.toast('Branchling could not ask Claude for the plan; ask it to call the Branchling plan tool.'))
+    })
+    return { text: 'Asking Claude to write the plan with your own session…' }
+  }
+
+  if (sub === 'goal') {
+    if (!rest) return { text: 'Usage: /branchling goal <one punchy sentence, at most 90 characters>' }
+    if (rest.length > 90) return { text: `That is ${rest.length} characters; keep the goal to 90.` }
+    await appendLine($, `${projectDir(h, pr.project)}/plan.app.jsonl`, { at: new Date().toISOString(), source: 'command', goal: rest })
+    await refresh($)
+    return { text: `Goal set and locked: "${rest}". Claude keeps it when refreshing the plan.` }
+  }
+
+  const eff = await effective($, h, pr.project, es)
+  const pct = percentOf(eff.tasks)
+
+  if (sub === 'usage') {
+    const us = await readUsage($, h, pr.project)
+    if (!us.length) return { text: 'No Claude usage measured here yet. Every Claude Code turn in this folder is counted from now on.' }
+    const t = today()
+    const weekAgo = localDay(new Date(Date.now() - 6 * 86_400_000))
+    const row = (name: string, ls: UsageLine[]) => {
+      const x = usageSum(ls)
+      return `  ${name.padEnd(10)} ${String(x.turns).padStart(5)} turns · ${tokens(x.fresh).padStart(6)} new in · ${tokens(x.read).padStart(6)} cached in · ${tokens(x.output).padStart(6)} out`
+    }
+    const all = usageSum(us)
+    const done = eff.tasks.filter(x => x.status === 'done' && x.doneAt && x.doneAt >= us.map(u => u.date).sort()[0]).length
+    const byBranch = [...new Set(us.map(u => u.branch))].map(b => row(b, us.filter(u => u.branch === b)))
+    return {
+      text: [
+        `Claude Code usage in ${pr.project} (measured since ${us.map(u => u.date).sort()[0]}, ${all.sessions} session${all.sessions > 1 ? 's' : ''})`,
+        row('today', us.filter(u => u.date === t)),
+        row('7 days', us.filter(u => u.date >= weekAgo)),
+        row('all', us),
+        `By branch:`,
+        ...byBranch,
+        done ? `Per finished task: ~${tokens(Math.round((all.fresh + all.read + all.output) / done))} tokens (${done} task${done > 1 ? 's' : ''} done since measuring began)` : '',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    }
+  }
+
+  if (sub === 'tasks') {
+    if (!eff.tasks.length) return { text: 'No planned tasks yet. Run /branchling plan.' }
+    const mark: Record<Status, string> = { todo: '▢', doing: '▶', blocked: '⛔', done: '✓', dropped: '–' }
+    return {
+      text: `${eff.goal ?? pr.project} · ${pct ?? 0}%\n${eff.tasks.map(t => `  ${mark[t.status]} ${t.id} ${t.title} (${t.size}${t.branch ? `, ${t.branch}` : ''})`).join('\n')}\n\nA commit whose subject ends with [t3] closes task t3.`,
+    }
+  }
+
+  if (sub === 'progress' || sub === 'problem' || sub === 'pause' || sub === 'hold') {
+    const kind: Kind = sub === 'hold' ? 'pause' : sub
+    if (!rest) return { text: `Usage: /branchling ${sub} <one line>` }
+    const x = await add($, h, pr, { branch: await currentBranch($, pr.root), kind, text: rest, quote: null, source: 'manual', tag: 'manual', task: TASK_TAG.exec(rest)?.[1] })
+    return { text: `Recorded: ${LABEL[x.kind]} ${signed(POINTS[x.kind])} · ${x.text}` }
+  }
+
+  if (sub === 'solve') {
+    const [no, ...comment] = restParts
+    const p = open[Number(no) - 1]
+    if (!p || !comment.length) return { text: 'Usage: /branchling solve <open problem no> <one line>. Numbers: /branchling open' }
+    const x = await add($, h, pr, { branch: p.branch, kind: 'solution', text: comment.join(' '), quote: p.id, source: 'manual', tag: p.tag })
+    return { text: `Solved (+2): "${p.text}" → ${x.text}` }
+  }
+
+  const wait = waiting(es)
+
+  if (sub === 'ask') {
+    if (!rest) return { text: 'Usage: /branchling ask <what needs approving>' }
+    const x = await add($, h, pr, { branch: await currentBranch($, pr.root), kind: 'pause', text: rest, quote: null, source: 'manual', tag: 'approval' })
+    return { text: `Waiting for approval: ${x.text}` }
+  }
+
+  if (sub === 'approve') {
+    const [no, ...comment] = restParts
+    const a = wait.approvals[Number(no) - 1]
+    if (!a) return { text: 'Usage: /branchling approve <no> [what was decided]. Numbers: /branchling open' }
+    await add($, h, pr, { branch: a.branch, kind: 'progress', text: comment.join(' ') || `Approved: ${a.text}`, quote: a.id, source: 'manual', tag: 'approved' })
+    return { text: `Approved: ${a.text}` }
+  }
+
+  const openText = open.length ? open.map((x, i) => `  ${i + 1}. ${x.date} · ${x.branch} · ${x.text}`).join('\n') : '  No open problems.'
+  if (sub === 'open') {
+    const list = (xs: Entry[]) => xs.map((x, i) => `  ${i + 1}. ${x.date} · ${x.branch} · ${x.text}`).join('\n')
+    return {
+      text: [
+        `Open problems (${pr.project}):\n${openText}`,
+        wait.approvals.length ? `Waiting for approval (/branchling approve <no>):\n${list(wait.approvals)}` : '',
+        wait.holds.length ? `On hold:\n${list(wait.holds)}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n\n'),
+    }
+  }
+
+  const t = today()
+  const todays = es.filter(x => x.date === t)
+  const pts = scoreAll(es)
+  const total = sumPoints(pts, es)
+  const day = sumPoints(pts, todays)
+  const list = todays.length
+    ? todays.map(x => `  ${signed(pts.get(x.id) ?? POINTS[x.kind]).padStart(2)} ${LABEL[x.kind]} · ${x.branch} · ${x.text}`).join('\n')
+    : '  Nothing recorded today yet.'
+  const nextUp = remaining(eff.tasks).slice(0, 3)
+  const head = eff.goal
+    ? `${eff.goal}\n${pct ?? 0}% done${nextUp.length ? ` · next: ${nextUp.map(x => `${x.id} ${x.title}`).join(' · ')}` : ''}\n\n`
+    : 'No goal yet: /branchling plan\n\n'
+  return {
+    text: `${head}Branchling · ${pr.project}: today ${signed(day)}, momentum ${signed(total)} (${es.length} entries)\n${list}\nOpen problems:\n${openText}\n\nPlan: /branchling plan · Tasks: /branchling tasks · Claude usage: /branchling usage · Manual: /branchling progress|problem|hold <text> · Solve: /branchling solve <no> <text>`,
+  }
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -1476,215 +1687,5 @@ export const register: Register = on => {
     return ran
   })
 
-  // The /branchling command; the command tool runs the same when the person typed it while Claude was busy.
-  const branchlingCommand = async ($: EngineInterface, e: { args?: string }): Promise<any> => {
-    const h = await homeDir($)
-    const cwd = await $.session.cwd()
-    const [sub = '', ...restParts] = (e.args ?? '').trim().split(/\s+/)
-    const rest = restParts.join(' ').trim()
-
-    if (sub === 'link') {
-      if (!rest) return { text: 'Usage: /branchling link <project name> [folder]' }
-      // "/branchling link Ortak Masa ~/Projects/katilim-app": a last word that is a path names the folder.
-      const words = rest.split(/\s+/)
-      const dirWord = words.length > 1 && /^[~/.]/.test(words[words.length - 1] ?? "") ? words.pop() : undefined
-      const dir = dirWord ? resolvePath(cwd, dirWord, h) : cwd
-      if (dirWord && !(await $.fs.exists(dir))) return { text: `${dir} does not exist.` }
-      const g = await $.process.run(['git', '-C', dir, 'rev-parse', '--show-toplevel'])
-      const root = g.exitCode === 0 && g.stdout.trim() ? g.stdout.trim() : dir
-      if (root === h) return { text: 'This is your home folder. Name the project folder: /branchling link <name> <folder>' }
-      if (root === `${h}/.branchling` || root.startsWith(`${h}/.branchling/`)) return { text: 'That is Branchling\'s own folder, where the almanac is kept. Name the folder of the project\'s code: /branchling link <name> <folder>' }
-      const project = slug(words.join(' ')) || 'project'
-      const aliases = await readAliases($, h)
-      if (project in aliases) {
-        delete aliases[project]
-        await $.fs.write(`${h}/.branchling/aliases.json`, JSON.stringify(aliases, null, 2) + '\n')
-      }
-      if (await $.fs.exists(`${root}/.branchling.json`)) {
-        await $.fs.write(`${root}/.branchling.json`, JSON.stringify({ project }, null, 2) + '\n')
-      } else {
-        await setLink($, h, root, project)
-      }
-      await refresh($)
-      return { text: `${root} is now linked to the "${project}" almanac. Tests, builds, commits and merges there are recorded automatically. Next: /branchling plan ${dirWord ? project : ''}`.trimEnd() }
-    }
-
-    if (sub === 'phone') return { text: await phoneCommand($, h, rest) }
-
-    if (sub === 'off') {
-      // "/branchling off" (this folder), "/branchling off ~/Projects/app" (a folder) or "/branchling off ortak-masa" (every folder of a project).
-      let roots: string[]
-      if (rest && !/^[~/.]/.test(rest)) {
-        const name = slug(rest)
-        const links = await readLinks($, h)
-        roots = Object.keys(links).filter(r => links[r] === name)
-        if (!roots.length) return { text: `No folder records into "${name}".` }
-      } else {
-        const dir = rest ? resolvePath(cwd, rest, h) : cwd
-        const root = (await gitRoot($, dir)) ?? dir
-        if (root === h) return { text: 'This is your home folder. Name what to stop: /branchling off <folder> or /branchling off <project name>' }
-        roots = [root]
-      }
-      for (const root of roots) {
-        if (await $.fs.exists(`${root}/.branchling.json`)) return { text: `${root} is linked by ${root}/.branchling.json; delete that file to leave Branchling.` }
-        await setLink($, h, root, null)
-        for (const [k, p] of workedIn) if (p.root === root) workedIn.delete(k)
-        if (lastWorked?.root === root) lastWorked = null
-      }
-      await refresh($)
-      return { text: `${roots.join(', ')} no longer recorded. What was recorded stays in the app; to record again: /branchling link <name> <folder>` }
-    }
-
-    if (sub === 'plan' && !rest) {
-      const many = whichOne()
-      if (many) return { text: many }
-    }
-    let found = await projectFor($, h, cwd, sub === 'plan' ? rest : undefined)
-    if (typeof found === 'string') return { text: found }
-    let guessed = false
-    if (!found && sub === 'plan') {
-      const root = await gitRoot($, cwd)
-      if (root && root !== h) {
-        found = { root, project: slug(root.split('/').pop() ?? '') || 'project' }
-        guessed = true
-      }
-    }
-    if (!found) return { text: notHere(cwd) }
-    const pr = found
-    const es = await readAll($, h, pr.project)
-    const open = openProblems(es)
-
-    if (sub === 'plan') {
-      // A command can't submit while it holds the turn: queue the prompt just after it answers.
-      const ask = {
-        text:
-          `Write the Branchling plan for the project "${pr.project}" in ${pr.root}. Call the Branchling plan tool (mcp__…__plan, load it with ToolSearch \"branchling plan\" if it is not loaded) with action "read" and project "${pr.root}", ` +
-          `look at that repository only as much as you need, then call it with action "write", project "${pr.root}" and the whole plan. ` +
-          (await (async () => {
-            const links = await readLinks($, h)
-            const others = Object.keys(links).filter(r => links[r] === pr.project && r !== pr.root)
-            return others.length ? `The project spans more folders, all one plan: ${others.join(', ')}; look at them too as far as the plan needs. ` : ''
-          })()) +
-          (rest
-            ? ''
-            : `Branchling chose ${pr.root} ${guessed ? 'only because this session was opened there' : 'because it is the only project this session worked in'}. ` +
-              `If this conversation is working on a different project, use that project's folder as "project" instead; ` +
-              `if that project has no git repository yet, write nothing and tell the user to run "git init" in its folder, then /branchling plan <folder>. `) +
-          `${languageRule((await settings($, h)).language)} ` +
-          `Finish with the goal sentence and the progress in one line.`,
-      }
-      $.clock.after(50, () => {
-        $.prompt.submit(ask).catch(() => $.ui.toast('Branchling could not ask Claude for the plan; ask it to call the Branchling plan tool.'))
-      })
-      return { text: 'Asking Claude to write the plan with your own session…' }
-    }
-
-    if (sub === 'goal') {
-      if (!rest) return { text: 'Usage: /branchling goal <one punchy sentence, at most 90 characters>' }
-      if (rest.length > 90) return { text: `That is ${rest.length} characters; keep the goal to 90.` }
-      await appendLine($, `${projectDir(h, pr.project)}/plan.app.jsonl`, { at: new Date().toISOString(), source: 'command', goal: rest })
-      await refresh($)
-      return { text: `Goal set and locked: "${rest}". Claude keeps it when refreshing the plan.` }
-    }
-
-    const eff = await effective($, h, pr.project, es)
-    const pct = percentOf(eff.tasks)
-
-    if (sub === 'usage') {
-      const us = await readUsage($, h, pr.project)
-      if (!us.length) return { text: 'No Claude usage measured here yet. Every Claude Code turn in this folder is counted from now on.' }
-      const t = today()
-      const weekAgo = localDay(new Date(Date.now() - 6 * 86_400_000))
-      const row = (name: string, ls: UsageLine[]) => {
-        const x = usageSum(ls)
-        return `  ${name.padEnd(10)} ${String(x.turns).padStart(5)} turns · ${tokens(x.fresh).padStart(6)} new in · ${tokens(x.read).padStart(6)} cached in · ${tokens(x.output).padStart(6)} out`
-      }
-      const all = usageSum(us)
-      const done = eff.tasks.filter(x => x.status === 'done' && x.doneAt && x.doneAt >= us.map(u => u.date).sort()[0]).length
-      const byBranch = [...new Set(us.map(u => u.branch))].map(b => row(b, us.filter(u => u.branch === b)))
-      return {
-        text: [
-          `Claude Code usage in ${pr.project} (measured since ${us.map(u => u.date).sort()[0]}, ${all.sessions} session${all.sessions > 1 ? 's' : ''})`,
-          row('today', us.filter(u => u.date === t)),
-          row('7 days', us.filter(u => u.date >= weekAgo)),
-          row('all', us),
-          `By branch:`,
-          ...byBranch,
-          done ? `Per finished task: ~${tokens(Math.round((all.fresh + all.read + all.output) / done))} tokens (${done} task${done > 1 ? 's' : ''} done since measuring began)` : '',
-        ]
-          .filter(Boolean)
-          .join('\n'),
-      }
-    }
-
-    if (sub === 'tasks') {
-      if (!eff.tasks.length) return { text: 'No planned tasks yet. Run /branchling plan.' }
-      const mark: Record<Status, string> = { todo: '▢', doing: '▶', blocked: '⛔', done: '✓', dropped: '–' }
-      return {
-        text: `${eff.goal ?? pr.project} · ${pct ?? 0}%\n${eff.tasks.map(t => `  ${mark[t.status]} ${t.id} ${t.title} (${t.size}${t.branch ? `, ${t.branch}` : ''})`).join('\n')}\n\nA commit whose subject ends with [t3] closes task t3.`,
-      }
-    }
-
-    if (sub === 'progress' || sub === 'problem' || sub === 'pause' || sub === 'hold') {
-      const kind: Kind = sub === 'hold' ? 'pause' : sub
-      if (!rest) return { text: `Usage: /branchling ${sub} <one line>` }
-      const x = await add($, h, pr, { branch: await currentBranch($, pr.root), kind, text: rest, quote: null, source: 'manual', tag: 'manual', task: TASK_TAG.exec(rest)?.[1] })
-      return { text: `Recorded: ${LABEL[x.kind]} ${signed(POINTS[x.kind])} · ${x.text}` }
-    }
-
-    if (sub === 'solve') {
-      const [no, ...comment] = restParts
-      const p = open[Number(no) - 1]
-      if (!p || !comment.length) return { text: 'Usage: /branchling solve <open problem no> <one line>. Numbers: /branchling open' }
-      const x = await add($, h, pr, { branch: p.branch, kind: 'solution', text: comment.join(' '), quote: p.id, source: 'manual', tag: p.tag })
-      return { text: `Solved (+2): "${p.text}" → ${x.text}` }
-    }
-
-    const wait = waiting(es)
-
-    if (sub === 'ask') {
-      if (!rest) return { text: 'Usage: /branchling ask <what needs approving>' }
-      const x = await add($, h, pr, { branch: await currentBranch($, pr.root), kind: 'pause', text: rest, quote: null, source: 'manual', tag: 'approval' })
-      return { text: `Waiting for approval: ${x.text}` }
-    }
-
-    if (sub === 'approve') {
-      const [no, ...comment] = restParts
-      const a = wait.approvals[Number(no) - 1]
-      if (!a) return { text: 'Usage: /branchling approve <no> [what was decided]. Numbers: /branchling open' }
-      await add($, h, pr, { branch: a.branch, kind: 'progress', text: comment.join(' ') || `Approved: ${a.text}`, quote: a.id, source: 'manual', tag: 'approved' })
-      return { text: `Approved: ${a.text}` }
-    }
-
-    const openText = open.length ? open.map((x, i) => `  ${i + 1}. ${x.date} · ${x.branch} · ${x.text}`).join('\n') : '  No open problems.'
-    if (sub === 'open') {
-      const list = (xs: Entry[]) => xs.map((x, i) => `  ${i + 1}. ${x.date} · ${x.branch} · ${x.text}`).join('\n')
-      return {
-        text: [
-          `Open problems (${pr.project}):\n${openText}`,
-          wait.approvals.length ? `Waiting for approval (/branchling approve <no>):\n${list(wait.approvals)}` : '',
-          wait.holds.length ? `On hold:\n${list(wait.holds)}` : '',
-        ]
-          .filter(Boolean)
-          .join('\n\n'),
-      }
-    }
-
-    const t = today()
-    const todays = es.filter(x => x.date === t)
-    const pts = scoreAll(es)
-    const total = sumPoints(pts, es)
-    const day = sumPoints(pts, todays)
-    const list = todays.length
-      ? todays.map(x => `  ${signed(pts.get(x.id) ?? POINTS[x.kind]).padStart(2)} ${LABEL[x.kind]} · ${x.branch} · ${x.text}`).join('\n')
-      : '  Nothing recorded today yet.'
-    const nextUp = remaining(eff.tasks).slice(0, 3)
-    const head = eff.goal
-      ? `${eff.goal}\n${pct ?? 0}% done${nextUp.length ? ` · next: ${nextUp.map(x => `${x.id} ${x.title}`).join(' · ')}` : ''}\n\n`
-      : 'No goal yet: /branchling plan\n\n'
-    return {
-      text: `${head}Branchling · ${pr.project}: today ${signed(day)}, momentum ${signed(total)} (${es.length} entries)\n${list}\nOpen problems:\n${openText}\n\nPlan: /branchling plan · Tasks: /branchling tasks · Claude usage: /branchling usage · Manual: /branchling progress|problem|hold <text> · Solve: /branchling solve <no> <text>`,
-    }
-  }
   on('command.run', { command: 'branchling' }, ($, e) => branchlingCommand($, e))
 }
