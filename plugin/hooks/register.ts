@@ -158,8 +158,10 @@ function resolveAlias(aliases: Record<string, string | null>, name: string): str
   return n
 }
 
-async function findProject($: EngineInterface, dir: string): Promise<Project | null> {
-  const found = (await findLink($, dir)) ?? (await joinOnce($, dir))
+/** The project a folder records into. An unlinked repository joins only with `join`: when real work happens there
+ * (a test, build, commit or merge, or an edited file) or the person names it, never because a session opened in it. */
+async function findProject($: EngineInterface, dir: string, join = false): Promise<Project | null> {
+  const found = (await findLink($, dir)) ?? (join ? await joinOnce($, dir) : null)
   if (!found) return null
   const h = await homeDir($)
   const project = resolveAlias(await readAliases($, h), found.project)
@@ -172,6 +174,30 @@ async function findProject($: EngineInterface, dir: string): Promise<Project | n
     }
   }
   return { root: found.root, project }
+}
+
+// Sessions often run from the home folder and reach projects with "cd <repo> && …" or by editing files there; the
+// project worked in last stands in for the session's own folder in commands and the plan tool.
+let lastWorked: Project | null = null
+
+/** The project a command or the plan tool means: a folder or almanac name if given, else this folder, else the last one worked in. */
+async function projectFor($: EngineInterface, h: string, cwd: string, given?: string): Promise<Project | null | string> {
+  const g = (given ?? '').trim()
+  if (g) {
+    if (/^[~/.]/.test(g)) return (await findProject($, resolvePath(cwd, g, h), true)) ?? `${g} is not a git repository.`
+    const name = slug(g)
+    const links = await readLinks($, h)
+    const root = Object.keys(links).find(r => links[r] === name)
+    if (root) return { root, project: name }
+    return `No folder is linked to the "${name}" almanac yet. Link it once with /branchling link ${name} <folder>, for example /branchling link ${name} ~/Projects/my-app`
+  }
+  return lastWorked ?? (await findProject($, cwd))
+}
+
+function notHere(cwd: string): string {
+  return `Claude Code is open in ${cwd}, which is not a git repository, and no project was worked on in this session yet. ` +
+    'Name the project: /branchling plan <folder or almanac name>, for example /branchling plan ~/Projects/my-app. ' +
+    'To record a folder under an almanac you made in the app: /branchling link <name> <folder>.'
 }
 
 // Projects join by themselves: the first time Claude Code works in a git repository, it gets an almanac named after
@@ -484,7 +510,7 @@ const AUTO: Record<Lang, { broke: (tag: string, line: string) => string; again: 
 async function refresh($: EngineInterface) {
   try {
     const h = await homeDir($)
-    const pr = await findProject($, await $.session.cwd())
+    const pr = lastWorked ?? (await findProject($, await $.session.cwd()))
     if (!pr) {
       note = undefined
       return
@@ -618,7 +644,7 @@ async function sessionUsd($: EngineInterface): Promise<number | undefined> {
 
 async function recordUsage($: EngineInterface, u: { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number; model: string }, agent: boolean) {
   const h = await homeDir($)
-  const pr = await findProject($, await $.session.cwd())
+  const pr = lastWorked ?? (await findProject($, await $.session.cwd()))
   const usd = await sessionUsd($)
   const delta = usd !== undefined && lastUsd !== undefined ? Math.max(0, usd - lastUsd) : undefined
   if (usd !== undefined) lastUsd = usd
@@ -665,7 +691,7 @@ async function handleAsk($: EngineInterface, e: object): Promise<{ result: strin
   const input = e as unknown as { action?: unknown; text?: unknown; id?: unknown }
   try {
     const h = await homeDir($)
-    const pr = await findProject($, await $.session.cwd())
+    const pr = lastWorked ?? (await findProject($, await $.session.cwd()))
     if (!pr) return { deny: 'This folder is not linked to a Branchling project.' }
     const text = typeof input.text === 'string' ? input.text.trim() : ''
     const pending = waiting(await readAll($, h, pr.project)).approvals
@@ -714,6 +740,10 @@ const PLAN_SCHEMA = {
   type: 'object',
   properties: {
     action: { type: 'string', enum: ['read', 'write'] },
+    project: {
+      type: 'string',
+      description: 'The project folder (absolute path) or almanac name. Leave out to use the session folder or the project worked on last.',
+    },
     goal: { type: 'string', description: 'One punchy sentence, at most 90 characters: what done looks like.' },
     summary: { type: 'string', description: 'At most 320 characters: where the project stands now.' },
     doneWhen: { type: 'array', items: { type: 'string' }, description: 'Up to 5 observable criteria for "done".' },
@@ -1205,7 +1235,7 @@ async function phoneCommand($: EngineInterface, h: string, rest: string): Promis
     return 'This computer does not write into iCloud itself. With a Mac, the Branchling Mac app sends the almanac to your iPhone. Without one, open Branchling › Connect on the iPhone, choose "Another computer" and paste the sentence it shows here.'
   }
   if (c.broken) return 'The iPhone connection has expired or iCloud refused it. In Branchling › Connect on the iPhone, copy the sentence again and paste it here.'
-  const pr = await findProject($, await $.session.cwd())
+  const pr = lastWorked ?? (await findProject($, await $.session.cwd()))
   if (pr && arg === 'now') {
     try {
       const n = await syncProject($, pr)
@@ -1257,12 +1287,20 @@ export const register: Register = on => {
   // Answered at tool.call: the tool only reads and writes Branchling's own files under ~/.branchling.
   on('tool.call', async ($, e, next) => {
     if (isAskTool(e.tool)) return handleAsk($, e)
-    if (!isPlanTool(e.tool)) return next(e)
-    const input = e as unknown as WriteInput & { action?: unknown }
+    if (!isPlanTool(e.tool)) {
+      const file = (e as unknown as { file_path?: unknown }).file_path
+      if ((e.tool === 'Edit' || e.tool === 'Write') && typeof file === 'string' && file.startsWith('/')) {
+        findProject($, file.replace(/\/[^/]*$/, ''), true).then(p => { if (p) lastWorked = p }).catch(() => {})
+      }
+      return next(e)
+    }
+    const input = e as unknown as WriteInput & { action?: unknown; project?: unknown }
     try {
       const h = await homeDir($)
-      const pr = await findProject($, await $.session.cwd())
-      if (!pr) return { deny: 'This folder has no Branchling almanac (it is not a git repository, or the user left it out with /branchling off). The user can add it with /branchling link <name>.' }
+      const cwd = await $.session.cwd()
+      const pr = await projectFor($, h, cwd, typeof input.project === 'string' ? input.project : undefined)
+      if (typeof pr === 'string') return { deny: pr }
+      if (!pr) return { deny: notHere(cwd) + ' Ask the user which folder, then call again with "project".' }
       if (input.action === 'read') return { result: await planDigest($, h, pr) }
       if (input.action === 'write') {
         const r = await planWrite($, h, pr, input)
@@ -1282,8 +1320,13 @@ export const register: Register = on => {
       const h = await homeDir($)
       const cd = e.command.match(CD_PREFIX)
       const cwd = await $.session.cwd()
-      const pr = await findProject($, cd ? resolvePath(cwd, cd[1], h) : cwd)
+      const work = segments(e.command.replace(CD_PREFIX, '')).some(s => TEST_S.test(s) || BUILD_S.test(s) || COMMIT_S.test(s) || !!mergeSource(s))
+      const pr = await findProject($, cd ? resolvePath(cwd, cd[1], h) : cwd, work)
       if (!pr) return ran
+      if (lastWorked?.project !== pr.project) {
+        lastWorked = pr
+        refresh($).catch(() => {})
+      }
       const segs = segments(e.command.replace(CD_PREFIX, ''))
       const output = String(ran.text ?? '')
       const tag = segs.some(s => TEST_S.test(s)) ? 'test' : segs.some(s => BUILD_S.test(s)) ? 'build' : ''
@@ -1349,10 +1392,16 @@ export const register: Register = on => {
     const rest = restParts.join(' ').trim()
 
     if (sub === 'link') {
-      if (!rest) return { text: 'Usage: /branchling link <project name>' }
-      const g = await $.process.run(['git', '-C', cwd, 'rev-parse', '--show-toplevel'])
-      const root = g.exitCode === 0 && g.stdout.trim() ? g.stdout.trim() : cwd
-      const project = slug(rest) || 'project'
+      if (!rest) return { text: 'Usage: /branchling link <project name> [folder]' }
+      // "/branchling link Ortak Masa ~/Projects/katilim-app": a last word that is a path names the folder.
+      const words = rest.split(/\s+/)
+      const dirWord = words.length > 1 && /^[~/.]/.test(words[words.length - 1] ?? "") ? words.pop() : undefined
+      const dir = dirWord ? resolvePath(cwd, dirWord, h) : cwd
+      if (dirWord && !(await $.fs.exists(dir))) return { text: `${dir} does not exist.` }
+      const g = await $.process.run(['git', '-C', dir, 'rev-parse', '--show-toplevel'])
+      const root = g.exitCode === 0 && g.stdout.trim() ? g.stdout.trim() : dir
+      if (root === h) return { text: 'This is your home folder. Name the project folder: /branchling link <name> <folder>' }
+      const project = slug(words.join(' ')) || 'project'
       const aliases = await readAliases($, h)
       if (project in aliases) {
         delete aliases[project]
@@ -1364,7 +1413,7 @@ export const register: Register = on => {
         await setLink($, h, root, project)
       }
       await refresh($)
-      return { text: `${root} is now linked to the "${project}" almanac. Tests, builds, commits and merges here are recorded automatically. Next: /branchling plan` }
+      return { text: `${root} is now linked to the "${project}" almanac. Tests, builds, commits and merges there are recorded automatically. Next: /branchling plan ${dirWord ? project : ''}`.trimEnd() }
     }
 
     if (sub === 'phone') return { text: await phoneCommand($, h, rest) }
@@ -1377,8 +1426,18 @@ export const register: Register = on => {
       return { text: `${root} no longer joins the almanac. What was recorded stays; to join again: /branchling link <name>` }
     }
 
-    const pr = await findProject($, cwd)
-    if (!pr) return { text: 'This folder is not a git repository, so it has no almanac. To give it one anyway: /branchling link <project name>' }
+    let found = await projectFor($, h, cwd, sub === 'plan' ? rest : undefined)
+    if (typeof found === 'string') return { text: found }
+    let guessed = false
+    if (!found && sub === 'plan') {
+      const root = await gitRoot($, cwd)
+      if (root && root !== h) {
+        found = { root, project: slug(root.split('/').pop() ?? '') || 'project' }
+        guessed = true
+      }
+    }
+    if (!found) return { text: notHere(cwd) }
+    const pr = found
     const es = await readAll($, h, pr.project)
     const open = openProblems(es)
 
@@ -1386,8 +1445,13 @@ export const register: Register = on => {
       // A command can't submit while it holds the turn: queue the prompt just after it answers.
       const ask = {
         text:
-          `Write the Branchling plan for this project ("${pr.project}"). Call the Branchling plan tool (mcp__…__plan, load it with ToolSearch \"branchling plan\" if it is not loaded) with action "read", ` +
-          `look at the repository only as much as you need, then call it with action "write" with the whole plan. ` +
+          `Write the Branchling plan for the project "${pr.project}" in ${pr.root}. Call the Branchling plan tool (mcp__…__plan, load it with ToolSearch \"branchling plan\" if it is not loaded) with action "read" and project "${pr.root}", ` +
+          `look at that repository only as much as you need, then call it with action "write", project "${pr.root}" and the whole plan. ` +
+          (rest
+            ? ''
+            : `Branchling chose ${pr.root} ${guessed ? 'only because this session was opened there' : 'from the work done in this session'}. ` +
+              `If this conversation is working on a different project, use that project's folder as "project" instead; ` +
+              `if that project has no git repository yet, write nothing and tell the user to run "git init" in its folder, then /branchling plan <folder>. `) +
           `${languageRule((await settings($, h)).language)} ` +
           `Finish with the goal sentence and the progress in one line.`,
       }
