@@ -5,7 +5,7 @@
     {
       "name": "branchling",
       "source": "./plugin",
-      "description": "Turns tests, builds, commits and merges in a linked project into one-line almanac entries for the Branchling app."
+      "description": "Turns tests, builds, commits and merges in your projects into one-line almanac entries for the Branchling app."
     }
   ]
 }

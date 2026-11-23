@@ -1,4 +1,5 @@
 import type { EngineInterface, Register } from 'claude-code'
+import { fromBase64, seal, toBase64 } from './seal'
 
 // Branchling: turns what happens in a linked project (.branchling.json) into one-line entries,
 // and keeps the project's goal and plan, written by the user's own Claude through the `plan` tool.
@@ -158,7 +159,7 @@ function resolveAlias(aliases: Record<string, string | null>, name: string): str
 }
 
 async function findProject($: EngineInterface, dir: string): Promise<Project | null> {
-  const found = await findLink($, dir)
+  const found = (await findLink($, dir)) ?? (await joinOnce($, dir))
   if (!found) return null
   const h = await homeDir($)
   const project = resolveAlias(await readAliases($, h), found.project)
@@ -171,6 +172,60 @@ async function findProject($: EngineInterface, dir: string): Promise<Project | n
     }
   }
   return { root: found.root, project }
+}
+
+// Projects join by themselves: the first time Claude Code works in a git repository, it gets an almanac named after
+// its folder. ~/.branchling/links.json keeps the choice per repository root ({ "<root>": "<project>" | null });
+// null is /branchling off. An older .branchling.json in the repository still wins.
+const linksFile = (h: string) => `${h}/.branchling/links.json`
+const joined = new Map<string, Project | null>()
+
+async function readLinks($: EngineInterface, h: string): Promise<Record<string, string | null>> {
+  try {
+    const j = JSON.parse(await $.fs.read(linksFile(h)))
+    return j && typeof j === 'object' ? j : {}
+  } catch {
+    return {}
+  }
+}
+
+async function setLink($: EngineInterface, h: string, root: string, project: string | null) {
+  const links = await readLinks($, h)
+  links[root] = project
+  await $.fs.write(linksFile(h), JSON.stringify(links, null, 2) + '\n')
+  joined.clear()
+}
+
+async function gitRoot($: EngineInterface, dir: string): Promise<string | null> {
+  const g = await $.process.run(['git', '-C', dir, 'rev-parse', '--show-toplevel'])
+  return g.exitCode === 0 && g.stdout.trim() ? g.stdout.trim() : null
+}
+
+async function joinOnce($: EngineInterface, dir: string): Promise<Project | null> {
+  if (joined.has(dir)) return joined.get(dir) ?? null
+  let found: Project | null = null
+  try {
+    const h = await homeDir($)
+    const root = await gitRoot($, dir)
+    if (root && root !== h) {
+      const links = await readLinks($, h)
+      if (root in links) {
+        const project = links[root]
+        found = project ? { root, project } : null
+      } else {
+        const taken = new Set(Object.values(links).filter(Boolean))
+        const base = slug(root.split('/').pop() ?? '') || 'project'
+        let project = base
+        for (let i = 2; taken.has(project); i++) project = `${base}-${i}`
+        await setLink($, h, root, project)
+        found = { root, project }
+      }
+    }
+  } catch {
+    // no git or no home: not a project
+  }
+  joined.set(dir, found)
+  return found
 }
 
 async function findLink($: EngineInterface, dir: string): Promise<Project | null> {
@@ -434,7 +489,7 @@ async function refresh($: EngineInterface) {
       note = undefined
       return
     }
-    schedulePush($, pr.project)
+    schedulePush($, pr)
     const es = await readAll($, h, pr.project)
     const eff = await effective($, h, pr.project, es)
     const t = today()
@@ -888,74 +943,38 @@ async function mergedNow($: EngineInterface, root: string, from: string, started
   }
 }
 
-// ---------- iCloud (iPhone without a Mac) ----------
-// The iPhone app makes a web token for the person's own iCloud and shows `/branchling phone <env> <api> <token>`.
-// With it the plugin writes the almanac straight into their private CloudKit database, in the same records the Mac
-// app writes ("AlmanacFile" in zone "Almanac"), and the iPhone reads them. No Branchling server sits in between.
+// ---------- GitHub (the iPhone and Mac read the almanac from the person's own repository) ----------
+// The Branchling apps keep a key pair in the person's iCloud Keychain and show one sentence with the public key.
+// Pasted into Claude Code, the key lands in ~/.branchling/github.json. After each change the plugin seals the
+// project's almanac files with it and pushes them to the `branchling` branch of the project's own GitHub repository.
+// The working tree, the index and every other branch stay untouched, and only the person's devices can open the
+// files: not GitHub, not teammates, not Branchling. There is no Branchling server.
 
-type Cloud = { env: 'production' | 'development'; api: string; web: string; broken?: boolean }
-
-const CLOUD_CONTAINER = 'iCloud.app.branchling'
-const CLOUD_INLINE = 700_000
+const BRANCH = 'branchling'
+const KEY_RE = /^[A-Za-z0-9+/]{43}=$/
+const PUSH_AFTER_MS = 15_000
 let pushGen = 0
-let zoneMade = false
-let cloudWarned = false
+let pushWarned = false
 
-const cloudFile = (h: string) => `${h}/.branchling/cloud.json`
-const sentFile = (h: string) => `${h}/.branchling/cloud-sent.json`
+const githubFile = (h: string) => `${h}/.branchling/github.json`
+const githubSentFile = (h: string) => `${h}/.branchling/github-sent.json`
 
-async function readCloud($: EngineInterface, h: string): Promise<Cloud | undefined> {
-  try {
-    const c = JSON.parse(await $.fs.read(cloudFile(h)))
-    return c && c.api && c.web ? c : undefined
-  } catch {
-    return undefined
-  }
-}
-
-async function writeCloud($: EngineInterface, h: string, c: Cloud) {
-  await $.fs.write(cloudFile(h), JSON.stringify(c, null, 2) + '\n')
-  await $.process.run(['chmod', '600', cloudFile(h)])
-}
-
-/** The record name the Mac app uses too: "f-" + the path's UTF-8 bytes in hex. */
-const recordName = (path: string) =>
-  'f-' + encodeURIComponent(path).replace(/%([0-9A-F]{2})|[\s\S]/g, (m, x) => (x ? x.toLowerCase() : m.charCodeAt(0).toString(16).padStart(2, '0')))
-
-const WEB_OFF =
-  'Your iCloud keeps its data off the web (Advanced Data Protection), so Claude Code cannot write into it yet. ' +
-  'On the iPhone: Settings › your name › iCloud › turn on "Access iCloud Data on the Web". ' +
-  'Then make a new command in Branchling › Connect Claude Code and paste it here. (The Branchling Mac app does not need this setting.)'
-
-async function cloudCall($: EngineInterface, h: string, c: Cloud, op: string, body: unknown): Promise<any> {
-  const url =
-    `https://api.apple-cloudkit.com/database/1/${CLOUD_CONTAINER}/${c.env}/private/${op}` +
-    `?ckAPIToken=${encodeURIComponent(c.api)}&ckWebAuthToken=${encodeURIComponent(c.web)}`
-  const r = await $.http.fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
-  // CloudKit may hand back a renewed web token; keep the newest one.
-  for (const [k, v] of Object.entries(r.headers)) {
-    if (/web-?auth-?token/i.test(k) && v && v !== c.web) {
-      c.web = v
-      await writeCloud($, h, c)
+/** The public key the almanac is sealed for: the one pasted on this computer, else the one a repository carries. */
+async function sealKey($: EngineInterface, h: string, root?: string): Promise<Uint8Array | undefined> {
+  for (const f of [githubFile(h), root ? `${root}/.claude/branchling/key.json` : '']) {
+    if (!f) continue
+    try {
+      const key = String(JSON.parse(await $.fs.read(f)).key ?? '')
+      if (KEY_RE.test(key)) return fromBase64(key)
+    } catch {
+      // not there: try the next
     }
   }
-  let j: any = {}
-  try {
-    j = JSON.parse(r.text || '{}')
-  } catch {
-    // not JSON: judged by the status below
-  }
-  const code = j.serverErrorCode as string | undefined
-  if (r.status === 401 || r.status === 421 || code === 'AUTHENTICATION_REQUIRED' || code === 'AUTHENTICATION_FAILED') {
-    throw Object.assign(new Error('auth'), { auth: true })
-  }
-  // Advanced Data Protection keeps iCloud data off the web unless "Access iCloud Data on the Web" is on.
-  if (code === 'ACCESS_DENIED' && /private db access disabled/i.test(String(j.reason ?? ''))) {
-    throw Object.assign(new Error('web access off'), { webOff: true })
-  }
-  if (!r.ok) throw new Error(`${r.status} ${code ?? ''} ${j.reason ?? ''}`.trim())
-  return j
+  return undefined
 }
+
+const git = (dollar: EngineInterface, root: string, args: string[], init: { env?: Record<string, string>; stdin?: string } = {}) =>
+  dollar.process.run(['git', '-C', root, ...args], { timeoutMs: 60_000, ...init })
 
 /** Every file of one project, by path relative to ~/.branchling, with a stamp that changes when the file does. */
 async function scanProject($: EngineInterface, h: string, project: string): Promise<Record<string, string>> {
@@ -977,132 +996,127 @@ async function scanProject($: EngineInterface, h: string, project: string): Prom
   return out
 }
 
-/** Sends what changed in these projects since the last push, and deletes records of their files that are gone. */
-async function pushProjects($: EngineInterface, projects: string[]): Promise<number> {
+/**
+ * Seals what changed in this project since the last push and pushes it to the `branchling` branch. Builds the commit
+ * with a private index and `commit-tree`, so nothing the person has checked out or staged moves. Returns the number
+ * of files sent; 0 when there is no key, no GitHub remote or nothing new.
+ */
+async function pushProject($: EngineInterface, pr: Project): Promise<number> {
   const h = await homeDir($)
-  const c = await readCloud($, h)
-  if (!c || c.broken) return 0
-  let sent: Record<string, string> = {}
+  const top = await git($, pr.root, ['rev-parse', '--show-toplevel'])
+  if (top.exitCode !== 0) return 0
+  const root = top.stdout.trim()
+  const key = await sealKey($, h, root)
+  if (!key) return 0
+  const remote = await git($, root, ['remote', 'get-url', 'origin'])
+  if (remote.exitCode !== 0 || !/github\.com[:/]/i.test(remote.stdout)) return 0
+
+  let sentAll: Record<string, Record<string, string>> = {}
   try {
-    sent = JSON.parse(await $.fs.read(sentFile(h)))
+    sentAll = JSON.parse(await $.fs.read(githubSentFile(h)))
   } catch {
     // first push
   }
-  try {
-    if (!zoneMade) {
-      await cloudCall($, h, c, 'zones/modify', { operations: [{ operationType: 'create', zone: { zoneID: { zoneName: 'Almanac' } } }] })
-      zoneMade = true
-    }
-    let count = 0
-    for (const project of projects) {
-      const now = await scanProject($, h, project)
-      const prefix = `projects/${project}/`
-      const ops: { op: unknown; path: string; stamp?: string }[] = []
-      for (const [path, stamp] of Object.entries(now)) {
-        if (sent[path] === stamp) continue
-        const size = Number(stamp.split('-')[0])
-        if (size > CLOUD_INLINE) continue
-        const bytes = await $.fs.read(`${h}/.branchling/${path}`, { as: 'bytes' })
-        const base64 = typeof bytes === 'string' ? bytes : bytes.base64
-        const fields = {
-          path: { value: path, type: 'STRING' },
-          body: { value: base64, type: 'BYTES' },
-          modified: { value: Number(stamp.split('-')[1]) || Date.now(), type: 'TIMESTAMP' },
-        }
-        ops.push({ op: { operationType: 'forceReplace', record: { recordName: recordName(path), recordType: 'AlmanacFile', fields } }, path, stamp })
-      }
-      for (const path of Object.keys(sent)) {
-        if (path.startsWith(prefix) && !(path in now)) ops.push({ op: { operationType: 'forceDelete', record: { recordName: recordName(path) } }, path })
-      }
-      for (let i = 0; i < ops.length; i += 100) {
-        const chunk = ops.slice(i, i + 100)
-        const j = await cloudCall($, h, c, 'records/modify', { zoneID: { zoneName: 'Almanac' }, atomic: false, operations: chunk.map(o => o.op) })
-        const failed = new Set<string>((j.records ?? []).filter((r: any) => r.serverErrorCode && r.serverErrorCode !== 'NOT_FOUND').map((r: any) => r.recordName))
-        for (const o of chunk) {
-          if (failed.has(recordName(o.path))) continue
-          if (o.stamp) sent[o.path] = o.stamp
-          else delete sent[o.path]
-          count++
-        }
-      }
-    }
-    await $.fs.write(sentFile(h), JSON.stringify(sent) + '\n')
-    return count
-  } catch (err: any) {
-    if (err?.auth || err?.webOff) {
-      c.broken = true
-      await writeCloud($, h, c)
-      if (!cloudWarned) {
-        cloudWarned = true
-        $.ui.toast(
-          err?.webOff
-            ? `Branchling: ${WEB_OFF}`
-            : 'Branchling: the iPhone connection has expired. On the iPhone, open Branchling › Connect Claude Code and paste the new command here.',
-        )
-      }
-    }
-    throw err
+  const slot = `${root}#${pr.project}`
+  const sent = sentAll[slot] ?? {}
+  const now = await scanProject($, h, pr.project)
+  const changed = Object.keys(now).filter(p => sent[p] !== now[p])
+  const gone = Object.keys(sent).filter(p => !(p in now))
+  if (!changed.length && !gone.length) return 0
+
+  const sealed: Record<string, string> = {}
+  for (const path of changed) {
+    const raw = await $.fs.read(`${h}/.branchling/${path}`, { as: 'bytes' })
+    sealed[path] = toBase64(await seal(key, fromBase64(typeof raw === 'string' ? raw : raw.base64))) + '\n'
   }
+
+  const env = {
+    GIT_INDEX_FILE: `${h}/.branchling/push-index`,
+    GIT_AUTHOR_NAME: 'Branchling',
+    GIT_AUTHOR_EMAIL: 'almanac@branchling.invalid',
+    GIT_COMMITTER_NAME: 'Branchling',
+    GIT_COMMITTER_EMAIL: 'almanac@branchling.invalid',
+  }
+  const LOCAL = 'refs/branchling/almanac'
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const f = await git($, root, ['fetch', '--quiet', '--no-tags', 'origin', `+refs/heads/${BRANCH}:${LOCAL}`])
+    const missing = f.exitCode !== 0 && /couldn't find remote ref|could not find remote ref/i.test(f.stderr)
+    if (f.exitCode !== 0 && !missing) throw new Error(`git fetch: ${f.stderr.trim().split('\n').pop()}`)
+    const parent = missing ? '' : (await git($, root, ['rev-parse', LOCAL])).stdout.trim()
+    const rt = await git($, root, parent ? ['read-tree', parent] : ['read-tree', '--empty'], { env })
+    if (rt.exitCode !== 0) throw new Error(`git read-tree: ${rt.stderr.trim()}`)
+    for (const [path, body] of Object.entries(sealed)) {
+      const b = await git($, root, ['hash-object', '-w', '--stdin'], { stdin: body })
+      const u = await git($, root, ['update-index', '--add', '--cacheinfo', `100644,${b.stdout.trim()},${path}`], { env })
+      if (b.exitCode !== 0 || u.exitCode !== 0) throw new Error(`git: ${(b.stderr || u.stderr).trim()}`)
+    }
+    for (const path of gone) await git($, root, ['update-index', '--force-remove', path], { env })
+    const tree = (await git($, root, ['write-tree'], { env })).stdout.trim()
+    if (parent && (await git($, root, ['rev-parse', `${parent}^{tree}`])).stdout.trim() === tree) break
+    // [skip ci]: a push to this branch must not start the repository's workflows.
+    const c = await git($, root, ['commit-tree', tree, ...(parent ? ['-p', parent] : []), '-m', 'Branchling almanac (sealed) [skip ci]'], { env })
+    if (c.exitCode !== 0) throw new Error(`git commit-tree: ${c.stderr.trim()}`)
+    const p = await git($, root, ['push', '--quiet', '--no-verify', 'origin', `${c.stdout.trim()}:refs/heads/${BRANCH}`])
+    if (p.exitCode === 0) break
+    if (attempt === 2 || !/non-fast-forward|fetch first|rejected/i.test(p.stderr)) throw new Error(`git push: ${p.stderr.trim().split('\n').pop()}`)
+  }
+  for (const path of changed) sent[path] = now[path]!
+  for (const path of gone) delete sent[path]
+  sentAll[slot] = sent
+  await $.fs.write(githubSentFile(h), JSON.stringify(sentAll) + '\n')
+  return changed.length + gone.length
 }
 
-/** A few seconds after the last change, sends this project to iCloud (only when an iPhone is connected). */
-function schedulePush($: EngineInterface, project: string) {
+/** A while after the last change, sends this project's almanac to its repository (only when a key is set). */
+const noPush = new Set<string>()
+
+function schedulePush($: EngineInterface, pr: Project) {
+  if (noPush.has(pr.root)) return
   const gen = ++pushGen
-  $.clock.after(5000, async () => {
+  $.clock.after(PUSH_AFTER_MS, async () => {
     if (gen !== pushGen) return
     try {
-      await pushProjects($, [project])
-    } catch {
-      // the next change tries again
+      await pushProject($, pr)
+      pushWarned = false
+    } catch (err) {
+      const msg = String((err as Error)?.message ?? err)
+      // A repository this person may not push to (someone else's clone, a protected branch): leave it out quietly.
+      if (/permission|denied|\b403\b|not allowed|protected branch|read-only/i.test(msg)) {
+        noPush.add(pr.root)
+        return
+      }
+      if (!pushWarned) {
+        pushWarned = true
+        $.ui.toast(`Branchling could not send the almanac to GitHub (${msg}). It tries again after the next change.`)
+      }
     }
   })
 }
 
-async function allProjects($: EngineInterface, h: string): Promise<string[]> {
-  try {
-    return (await $.fs.list(`${h}/.branchling/projects`)).filter(f => f.kind === 'dir' && !f.name.startsWith('.')).map(f => f.name)
-  } catch {
-    return []
-  }
-}
-
 async function phoneCommand($: EngineInterface, h: string, rest: string): Promise<string> {
-  const [a = '', b = '', w = ''] = rest.split(/\s+/)
-  if (a === 'off') {
-    await $.fs.write(cloudFile(h), '{}\n')
-    await $.fs.write(sentFile(h), '{}\n')
-    return 'Disconnected. This computer no longer sends the almanac to your iPhone. What is already in iCloud stays until you delete it on the iPhone.'
+  const arg = rest.split(/\s+/)[0] ?? ''
+  if (arg === 'off') {
+    await $.fs.write(githubFile(h), '{}\n')
+    return 'This computer no longer sends the almanac to your iPhone. What is already on the branchling branch stays until you delete that branch.'
   }
-  if (a === '' || a === 'status') {
-    const c = await readCloud($, h)
-    if (!c) return 'No iPhone connected. On the iPhone, open Branchling › Connect Claude Code and paste the command it shows here.'
-    return c.broken
-      ? 'The iPhone connection has expired. On the iPhone, open Branchling › Connect Claude Code and paste the new command here.'
-      : `Connected (${c.env}). The almanac goes to your iPhone a few seconds after each change. To stop: /branchling phone off`
+  if (arg && KEY_RE.test(arg)) {
+    await $.fs.write(githubFile(h), JSON.stringify({ key: arg }, null, 2) + '\n')
+    const pr = await findProject($, await $.session.cwd())
+    if (!pr) return 'Key saved. Projects you work on here now reach your iPhone through their GitHub repository.'
+    try {
+      const n = await pushProject($, pr)
+      return n
+        ? `Key saved. Sent ${n} sealed file${n === 1 ? '' : 's'} of "${pr.project}" to its branchling branch; it appears on your iPhone in a moment.`
+        : `Key saved. "${pr.project}" has no GitHub remote yet, so it stays on this computer until it has one.`
+    } catch (err) {
+      return `Key saved, but sending failed (${String((err as Error)?.message ?? err)}). It tries again after the next change.`
+    }
   }
-  if ((a !== 'production' && a !== 'development') || !/^[0-9a-f]{64}$/.test(b) || w.length < 20) {
-    return 'That does not look like the command from the iPhone. Copy it again from Branchling › Connect Claude Code.'
-  }
-  const c: Cloud = { env: a, api: b, web: w }
-  try {
-    await cloudCall($, h, c, 'zones/modify', { operations: [{ operationType: 'create', zone: { zoneID: { zoneName: 'Almanac' } } }] })
-  } catch (err: any) {
-    if (err?.webOff) return WEB_OFF
-    return err?.auth
-      ? 'iCloud did not accept this command; it may be old. Make a new one on the iPhone and paste it here.'
-      : `Could not reach iCloud (${String(err?.message ?? err)}). Check the connection and paste the command again.`
-  }
-  await writeCloud($, h, c)
-  await $.fs.write(sentFile(h), '{}\n')
-  zoneMade = true
-  cloudWarned = false
-  const projects = await allProjects($, h)
-  try {
-    const n = await pushProjects($, projects)
-    return `Connected. Sent ${n} file${n === 1 ? '' : 's'} from ${projects.length} project${projects.length === 1 ? '' : 's'}; pull down on the iPhone to see them. From now on each change follows in a few seconds.`
-  } catch (err: any) {
-    return `Connected, but the first send failed (${String(err?.message ?? err)}). It tries again after the next change.`
-  }
+  if (arg) return 'That is not a Branchling key. Copy the sentence again from Branchling on your iPhone or Mac.'
+  const key = await sealKey($, h)
+  return key
+    ? 'Connected: each change is sealed with your key and sent to the branchling branch of the project\'s GitHub repository. To stop: /branchling phone off'
+    : 'Not connected. In Branchling on your iPhone or Mac, open Connect Claude Code and paste the sentence it shows here.'
 }
 
 // ---------- Hooks ----------
@@ -1112,7 +1126,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'branchling',
       description: "This project's almanac: today, goal and plan, open problems, manual entries, linking",
-      argumentHint: '[plan | phone [<code> | off] | goal <sentence> | tasks | usage | link <name> | progress|problem|hold <text> | ask <text> | approve <no> | solve <no> <text> | open]',
+      argumentHint: '[plan | phone [<key> | off] | off | goal <sentence> | tasks | usage | link <name> | progress|problem|hold <text> | ask <text> | approve <no> | solve <no> <text> | open]',
     })
     try {
       await $.tool.register({ name: 'plan', description: PLAN_TOOL_DESC, inputSchema: PLAN_SCHEMA })
@@ -1150,7 +1164,7 @@ export const register: Register = on => {
     try {
       const h = await homeDir($)
       const pr = await findProject($, await $.session.cwd())
-      if (!pr) return { deny: 'This folder is not linked to a Branchling project. The user can link it with /branchling link <name>.' }
+      if (!pr) return { deny: 'This folder has no Branchling almanac (it is not a git repository, or the user left it out with /branchling off). The user can add it with /branchling link <name>.' }
       if (input.action === 'read') return { result: await planDigest($, h, pr) }
       if (input.action === 'write') {
         const r = await planWrite($, h, pr, input)
@@ -1246,15 +1260,27 @@ export const register: Register = on => {
         delete aliases[project]
         await $.fs.write(`${h}/.branchling/aliases.json`, JSON.stringify(aliases, null, 2) + '\n')
       }
-      await $.fs.write(`${root}/.branchling.json`, JSON.stringify({ project }, null, 2) + '\n')
+      if (await $.fs.exists(`${root}/.branchling.json`)) {
+        await $.fs.write(`${root}/.branchling.json`, JSON.stringify({ project }, null, 2) + '\n')
+      } else {
+        await setLink($, h, root, project)
+      }
       await refresh($)
       return { text: `${root} is now linked to the "${project}" almanac. Tests, builds, commits and merges here are recorded automatically. Next: /branchling plan` }
     }
 
     if (sub === 'phone') return { text: await phoneCommand($, h, rest) }
 
+    if (sub === 'off') {
+      const root = (await gitRoot($, cwd)) ?? cwd
+      if (await $.fs.exists(`${root}/.branchling.json`)) return { text: `This folder is linked by ${root}/.branchling.json; delete that file to leave Branchling.` }
+      await setLink($, h, root, null)
+      await refresh($)
+      return { text: `${root} no longer joins the almanac. What was recorded stays; to join again: /branchling link <name>` }
+    }
+
     const pr = await findProject($, cwd)
-    if (!pr) return { text: 'This folder is not linked to an almanac. To link it: /branchling link <project name>' }
+    if (!pr) return { text: 'This folder is not a git repository, so it has no almanac. To give it one anyway: /branchling link <project name>' }
     const es = await readAll($, h, pr.project)
     const open = openProblems(es)
 
