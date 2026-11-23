@@ -5,7 +5,8 @@
 //   Stop                node .claude/branchling/record.mjs push   seals this session's entries, pushes them
 // A cloud session may only push to its own repository, so the sealed entries go to this repository's `branchling`
 // branch; the person's working branches are never touched and the commit says [skip ci]. On their computer the
-// Branchling plugin later copies the sealed files, unopened, into their private `branchling-almanac` repository.
+// Branchling plugin later fetches the sealed files with the person's own git and passes them on, unopened, into
+// their own iCloud (through Branchling for Mac, or straight from the plugin).
 // The entries are sealed with the public key in .claude/branchling/key.json: only the person's own iPhone and Mac
 // can open them. On a computer the plugin does the recording, so this stays quiet unless CLAUDE_CODE_REMOTE is true.
 // Plain Node, no packages. Sealed format: see plugin/hooks/seal.ts ("BLA1": X25519 + HKDF-SHA256 + ChaCha20-Poly1305).
