@@ -178,7 +178,23 @@ async function findProject($: EngineInterface, dir: string, join = false): Promi
 
 // Sessions often run from the home folder and reach projects with "cd <repo> && …" or by editing files there; the
 // project worked in last stands in for the session's own folder in commands and the plan tool.
+// Each Claude Code session runs its own copy of this module, so these belong to this session alone.
 let lastWorked: Project | null = null
+/** Every project this session worked in, by almanac name. */
+const workedIn = new Map<string, Project>()
+
+function noteWork(pr: Project) {
+  lastWorked = pr
+  workedIn.set(pr.project, pr)
+}
+
+/** When this session worked in more than one project, naming one is the only safe way: never guess the plan's project. */
+function whichOne(): string | null {
+  if (workedIn.size < 2) return null
+  const names = [...workedIn.values()]
+  return 'This session worked in more than one project, so Branchling will not guess. Pick one:\n' +
+    names.map(p => `  /branchling plan ${p.project}    (${p.root})`).join('\n')
+}
 
 /** The project a command or the plan tool means: a folder or almanac name if given, else this folder, else the last one worked in. */
 async function projectFor($: EngineInterface, h: string, cwd: string, given?: string): Promise<Project | null | string> {
@@ -548,7 +564,7 @@ async function refresh($: EngineInterface) {
     if (due && auto && eff.plan) {
       lines.push(
         `The Branchling plan was last written ${localDay(new Date(eff.plan.updatedAt))} and ${due} entr${due > 1 ? 'ies were' : 'y was'} recorded since. ` +
-          `When the user's current request is finished (never in the middle of it), refresh the plan once: call the Branchling plan tool (${TOOL}) with action "read", then with action "write". ` +
+          `When the user's current request is finished (never in the middle of it), refresh the plan once: call the Branchling plan tool (${TOOL}) with action "read", then with action "write", both with project "${pr.root}". ` +
           `${languageRule((await settings($, h)).language)} ` +
           `Afterwards say so in one short line.`,
       )
@@ -1290,7 +1306,7 @@ export const register: Register = on => {
     if (!isPlanTool(e.tool)) {
       const file = (e as unknown as { file_path?: unknown }).file_path
       if ((e.tool === 'Edit' || e.tool === 'Write') && typeof file === 'string' && file.startsWith('/')) {
-        findProject($, file.replace(/\/[^/]*$/, ''), true).then(p => { if (p) lastWorked = p }).catch(() => {})
+        findProject($, file.replace(/\/[^/]*$/, ''), true).then(p => { if (p) noteWork(p) }).catch(() => {})
       }
       return next(e)
     }
@@ -1298,7 +1314,10 @@ export const register: Register = on => {
     try {
       const h = await homeDir($)
       const cwd = await $.session.cwd()
-      const pr = await projectFor($, h, cwd, typeof input.project === 'string' ? input.project : undefined)
+      const named = typeof input.project === 'string' && input.project.trim() ? input.project : undefined
+      const many = named ? null : whichOne()
+      if (many) return { deny: many.replace('Pick one:', 'Ask the user which one, then call again with "project" set to its folder:') }
+      const pr = await projectFor($, h, cwd, named)
       if (typeof pr === 'string') return { deny: pr }
       if (!pr) return { deny: notHere(cwd) + ' Ask the user which folder, then call again with "project".' }
       if (input.action === 'read') return { result: await planDigest($, h, pr) }
@@ -1324,7 +1343,7 @@ export const register: Register = on => {
       const pr = await findProject($, cd ? resolvePath(cwd, cd[1], h) : cwd, work)
       if (!pr) return ran
       if (lastWorked?.project !== pr.project) {
-        lastWorked = pr
+        noteWork(pr)
         refresh($).catch(() => {})
       }
       const segs = segments(e.command.replace(CD_PREFIX, ''))
@@ -1426,6 +1445,10 @@ export const register: Register = on => {
       return { text: `${root} no longer joins the almanac. What was recorded stays; to join again: /branchling link <name>` }
     }
 
+    if (sub === 'plan' && !rest) {
+      const many = whichOne()
+      if (many) return { text: many }
+    }
     let found = await projectFor($, h, cwd, sub === 'plan' ? rest : undefined)
     if (typeof found === 'string') return { text: found }
     let guessed = false
@@ -1449,7 +1472,7 @@ export const register: Register = on => {
           `look at that repository only as much as you need, then call it with action "write", project "${pr.root}" and the whole plan. ` +
           (rest
             ? ''
-            : `Branchling chose ${pr.root} ${guessed ? 'only because this session was opened there' : 'from the work done in this session'}. ` +
+            : `Branchling chose ${pr.root} ${guessed ? 'only because this session was opened there' : 'because it is the only project this session worked in'}. ` +
               `If this conversation is working on a different project, use that project's folder as "project" instead; ` +
               `if that project has no git repository yet, write nothing and tell the user to run "git init" in its folder, then /branchling plan <folder>. `) +
           `${languageRule((await settings($, h)).language)} ` +
