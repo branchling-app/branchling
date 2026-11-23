@@ -38,12 +38,23 @@ cloud session). Then follow **A** on a computer or **B** in a cloud session.
    mkdir -p ~/.branchling
    printf '{ "key": "%s", "remote": "%s" }\n' '<KEY>' '<REMOTE>' > ~/.branchling/github.json
    ```
-4. Do not change the current repository.
-5. Tell the person:
-   "Branchling is set up. Type /reload-plugins once (or restart Claude Code); from then on every project you work
-   on here reaches your iPhone by itself. In the Branchling app, under Choose repositories, pick only
-   **branchling-almanac**. Branchling never sees your code: it only reads that repository, and everything in it
-   is sealed for your own devices."
+4. Let the Branchling app into that one repository: open GitHub's install page with only `branchling-almanac`
+   ticked, so the person never has to pick from a list of their repositories.
+   - With the GitHub CLI:
+     ```sh
+     U=$(gh api user --jq .id); R=$(gh api repos/$(gh api user --jq .login)/branchling-almanac --jq .id)
+     open "https://github.com/apps/branchling-almanac/installations/new/permissions?suggested_target_id=$U&repository_ids%5B%5D=$R"
+     ```
+     (`xdg-open` on Linux, `start ""` on Windows.) If Branchling Almanac is already installed, GitHub shows its
+     settings instead; then make sure only `branchling-almanac` is selected.
+   - Without it, open `https://github.com/apps/branchling-almanac/installations/new` and tell the person to choose
+     **Only select repositories** and tick only `branchling-almanac`.
+5. Do not change the current repository.
+6. Tell the person:
+   "Branchling is set up. On the GitHub page I opened, only branchling-almanac is ticked: press Approve & Install.
+   Then type /reload-plugins once (or restart Claude Code); from then on every project you work on here reaches
+   your iPhone by itself. Branchling never sees your code: it only reads branchling-almanac, and everything in it is
+   sealed for your own devices."
 
 ## B. In a cloud session
 
