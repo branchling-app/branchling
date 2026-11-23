@@ -1,28 +1,55 @@
 # Setting up Branchling (for Claude Code)
 
 The person pasted a sentence from the Branchling app on their iPhone or Mac:
-"Set up Branchling in this project with the key `<KEY>`", with a link to this page. Do the steps below for them,
-then answer in one or two sentences. `<KEY>` is a **public** key (44 characters, ending in `=`): it can only lock
-the almanac for the person's own devices and opens nothing, so it is safe in files, commits and chat.
+"Set up Branchling in this project with the key `<KEY>`", with a link to this page. Do the steps for them, then
+answer in a few sentences. `<KEY>` is a **public** key (44 characters, ending in `=`): it can only lock the almanac
+for the person's own devices and opens nothing, so it is safe in files, commits and chat.
 
-## 1. On a computer: the plugin
+**The promise to keep:** Branchling never reads the person's code. The almanac goes to a separate private repository
+that holds nothing else, and the Branchling app is only ever allowed into that repository. Do not write to the
+person's project repositories on a computer, and never ask them to give Branchling access to a project repository.
 
-Skip this step in a cloud session (the environment variable `CLAUDE_CODE_REMOTE` is `true`) or when the `claude`
-command is not available.
+First check where you run: the environment variable `CLAUDE_CODE_REMOTE` is `true` in Claude Code on the web (a
+cloud session). Then follow **A** on a computer or **B** in a cloud session.
 
-```sh
-claude plugin marketplace add branchling-app/branchling
-claude plugin install branchling@branchling
-mkdir -p ~/.branchling
-printf '{ "key": "%s" }\n' '<KEY>' > ~/.branchling/github.json
-```
+## A. On a computer
 
-From then on every git project worked on in Claude Code on this computer joins the person's almanac by itself.
+1. Install the free plugin (skip it when the `claude` command is not available and say so):
+   ```sh
+   claude plugin marketplace add branchling-app/branchling
+   claude plugin install branchling@branchling
+   ```
+2. Make the almanac repository: a **private** repository named `branchling-almanac` in the person's own GitHub
+   account. If it exists already, use it.
+   - With the GitHub CLI signed in (`gh auth status` succeeds):
+     ```sh
+     gh repo view branchling-almanac >/dev/null 2>&1 || gh repo create branchling-almanac --private --description "Sealed Branchling almanac. Only the owner's devices can read it."
+     ```
+     Take the remote URL from `gh repo view branchling-almanac --json sshUrl,url` and use the SSH URL when
+     `gh config get git_protocol` says `ssh`, otherwise `<url>.git`.
+   - Without the GitHub CLI: ask the person to open
+     `https://github.com/new?name=branchling-almanac&visibility=private` and press **Create repository**, and to
+     tell you their GitHub user name. The remote URL is `https://github.com/<user>/branchling-almanac.git` (use
+     `git@github.com:<user>/branchling-almanac.git` when their other repositories use SSH).
+   - Check that this computer can reach it: `git ls-remote <remote URL>` must succeed (an empty repository
+     prints nothing; that is fine).
+3. Write the connection, replacing `<KEY>` and `<REMOTE>`:
+   ```sh
+   mkdir -p ~/.branchling
+   printf '{ "key": "%s", "remote": "%s" }\n' '<KEY>' '<REMOTE>' > ~/.branchling/github.json
+   ```
+4. Do not change the current repository.
+5. Tell the person:
+   "Branchling is set up. Type /reload-plugins once (or restart Claude Code); from then on every project you work
+   on here reaches your iPhone by itself. In the Branchling app, under Choose repositories, pick only
+   **branchling-almanac**. Branchling never sees your code: it only reads that repository, and everything in it
+   is sealed for your own devices."
 
-## 2. In this repository: the cloud recorder
+## B. In a cloud session
 
-Do this in the current git repository, on a computer and in a cloud session alike. Cloud sessions do not load
-plugins; these files let them record too.
+A cloud session can only push to the repository it works on, so here a small recorder in this repository keeps
+the sealed entries on its own `branchling` branch. The person's computer carries them over into
+`branchling-almanac` the next time they work on this project there.
 
 1. Download `https://raw.githubusercontent.com/branchling-app/branchling/main/cloud/record.mjs` to
    `.claude/branchling/record.mjs`.
@@ -43,19 +70,16 @@ plugins; these files let them record too.
      }
    }
    ```
-4. Commit the three files with the message `Add Branchling recorder`. In a cloud session, push the branch as you
-   normally would.
-
-## 3. Tell the person
-
-- On a computer: "Branchling is set up. Type /reload-plugins (or restart Claude Code) once; from then on your
-  projects reach your iPhone by themselves."
-- In a cloud session: "Branchling is set up for this repository. Recording starts with the next session that
-  starts from a branch with this commit."
+4. Commit the three files with the message `Add Branchling recorder` and push the branch as you normally would.
+5. Tell the person:
+   "Branchling records this repository's cloud sessions from the next session on. The entries reach your iPhone
+   the next time you work on this project on a computer with Branchling set up. Without a computer, the iPhone
+   can read them from this repository's branchling branch only if you also allow this repository in the
+   Branchling app, which lets the app read its code; the app shows you when that is the case."
 
 ## What happens
 
-After each change the almanac (tests, builds, commits, merges, the plan) is sealed with the key and pushed to a
-separate branch named `branchling` in this repository. The person's working branches, pull requests and files are
-never touched, and the push is marked `[skip ci]` so no workflow runs. Only the person's own devices hold the private
-key; nobody else can read the branch, not GitHub, not teammates, not Branchling. There is no Branchling server.
+Tests, builds, commits, merges and the plan are sealed (X25519 + ChaCha20-Poly1305) with the person's public key
+before they leave the computer or the cloud session. Only the person's iPhone and Mac hold the private key, in
+their iCloud Keychain: GitHub, teammates and Branchling cannot read the almanac. The plugin and the recorder are
+open source in this repository. There is no Branchling server.

@@ -943,34 +943,49 @@ async function mergedNow($: EngineInterface, root: string, from: string, started
   }
 }
 
-// ---------- GitHub (the iPhone and Mac read the almanac from the person's own repository) ----------
+// ---------- GitHub (the iPhone and Mac read the almanac from the person's own almanac repository) ----------
 // The Branchling apps keep a key pair in the person's iCloud Keychain and show one sentence with the public key.
-// Pasted into Claude Code, the key lands in ~/.branchling/github.json. After each change the plugin seals the
-// project's almanac files with it and pushes them to the `branchling` branch of the project's own GitHub repository.
-// The working tree, the index and every other branch stay untouched, and only the person's devices can open the
-// files: not GitHub, not teammates, not Branchling. There is no Branchling server.
+// Pasted into Claude Code, it makes a private repository that holds nothing but the almanac (`branchling-almanac`)
+// and writes ~/.branchling/github.json: { key, remote }. After each change the plugin seals the almanac files with the
+// key and pushes them to the `branchling` branch of that repository, through a bare repository of its own in
+// ~/.branchling/almanac.git. The person's project repositories are never written to, and the GitHub App the
+// iPhone signs in with only needs the almanac repository: Branchling never gets near the code. Only the person's
+// devices can open the files: not GitHub, not teammates, not Branchling. There is no Branchling server.
+//
+// Claude Code in the cloud can only push to the repository the session works on, so there the recorder
+// (cloud/record.mjs, committed as .claude/branchling/record.mjs) puts its sealed entries on that repository's own
+// `branchling` branch. When the person next works on the project on this computer, the plugin carries those sealed
+// files over into the almanac repository as they are: it never needs, or has, the key that opens them.
 
 const BRANCH = 'branchling'
 const KEY_RE = /^[A-Za-z0-9+/]{43}=$/
+const GITHUB_URL = /^(https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)[\w.-]+\/[\w.-]+?(\.git)?$/
 const PUSH_AFTER_MS = 15_000
 let pushGen = 0
 let pushWarned = false
 
+type GitHubSetup = { key: Uint8Array; remote: string; device: string }
+
 const githubFile = (h: string) => `${h}/.branchling/github.json`
 const githubSentFile = (h: string) => `${h}/.branchling/github-sent.json`
+const almanacGit = (h: string) => `${h}/.branchling/almanac.git`
 
-/** The public key the almanac is sealed for: the one pasted on this computer, else the one a repository carries. */
-async function sealKey($: EngineInterface, h: string, root?: string): Promise<Uint8Array | undefined> {
-  for (const f of [githubFile(h), root ? `${root}/.claude/branchling/key.json` : '']) {
-    if (!f) continue
-    try {
-      const key = String(JSON.parse(await $.fs.read(f)).key ?? '')
-      if (KEY_RE.test(key)) return fromBase64(key)
-    } catch {
-      // not there: try the next
-    }
+/** The key and the almanac repository from ~/.branchling/github.json; a device id is added on first use. */
+async function githubSetup($: EngineInterface, h: string): Promise<GitHubSetup | undefined> {
+  let j: Record<string, unknown> = {}
+  try {
+    j = JSON.parse(await $.fs.read(githubFile(h)))
+  } catch {
+    return undefined
   }
-  return undefined
+  const key = String(j.key ?? ''), remote = String(j.remote ?? '').trim()
+  if (!KEY_RE.test(key) || !GITHUB_URL.test(remote)) return undefined
+  let device = String(j.device ?? '')
+  if (!/^[a-z0-9]{6,12}$/.test(device)) {
+    device = Array.from(crypto.getRandomValues(new Uint8Array(5)), b => (b % 36).toString(36)).join('') + 'mac'
+    await $.fs.write(githubFile(h), JSON.stringify({ ...j, device }, null, 2) + '\n')
+  }
+  return { key: fromBase64(key), remote, device }
 }
 
 const git = (dollar: EngineInterface, root: string, args: string[], init: { env?: Record<string, string>; stdin?: string } = {}) =>
@@ -997,19 +1012,27 @@ async function scanProject($: EngineInterface, h: string, project: string): Prom
 }
 
 /**
- * Seals what changed in this project since the last push and pushes it to the `branchling` branch. Builds the commit
- * with a private index and `commit-tree`, so nothing the person has checked out or staged moves. Returns the number
- * of files sent; 0 when there is no key, no GitHub remote or nothing new.
+ * Where a local file goes on the branch. Entry files carry this computer's id (`<day>.<device>.jsonl`), so two
+ * computers working on the same project never overwrite each other's day; the apps read every .jsonl in entries/.
+ */
+const branchPath = (path: string, device: string) => path.replace(/(\/entries\/\d{4}-\d{2}-\d{2})\.jsonl$/, `$1.${device}.jsonl`)
+
+/**
+ * Seals what changed in this project since the last push, picks up the sealed entries cloud sessions left on the
+ * project repository's own branchling branch, and pushes both to the almanac repository. Nothing in the project's
+ * repository moves. Returns the number of files sent; 0 when not connected or nothing is new.
  */
 async function pushProject($: EngineInterface, pr: Project): Promise<number> {
   const h = await homeDir($)
-  const top = await git($, pr.root, ['rev-parse', '--show-toplevel'])
-  if (top.exitCode !== 0) return 0
-  const root = top.stdout.trim()
-  const key = await sealKey($, h, root)
-  if (!key) return 0
-  const remote = await git($, root, ['remote', 'get-url', 'origin'])
-  if (remote.exitCode !== 0 || !/github\.com[:/]/i.test(remote.stdout)) return 0
+  const gh = await githubSetup($, h)
+  if (!gh) return 0
+  const bare = almanacGit(h)
+  try {
+    await $.fs.read(`${bare}/HEAD`)
+  } catch {
+    const init = await $.process.run(['git', 'init', '--quiet', '--bare', bare], { timeoutMs: 30_000 })
+    if (init.exitCode !== 0) throw new Error(`git init: ${init.stderr.trim()}`)
+  }
 
   let sentAll: Record<string, Record<string, string>> = {}
   try {
@@ -1017,17 +1040,44 @@ async function pushProject($: EngineInterface, pr: Project): Promise<number> {
   } catch {
     // first push
   }
-  const slot = `${root}#${pr.project}`
+  const slot = `${gh.remote}#${pr.project}`
   const sent = sentAll[slot] ?? {}
-  const now = await scanProject($, h, pr.project)
+  const now: Record<string, string> = {}
+  for (const [path, stamp] of Object.entries(await scanProject($, h, pr.project))) now[branchPath(path, gh.device)] = stamp
+
+  // Sealed entries from cloud sessions: only for a repository that carries the recorder.
+  const cloud: Record<string, string> = {}
+  const recorder = await $.fs.read(`${pr.root}/.claude/branchling/record.mjs`).then(() => true, () => false)
+  const origin = recorder ? (await git($, pr.root, ['config', '--get', 'remote.origin.url'])).stdout.trim() : ''
+  if (origin && GITHUB_URL.test(origin)) {
+    const ref = `refs/cloud/${pr.project}`
+    const f = await git($, bare, ['fetch', '--quiet', '--no-tags', origin, `+refs/heads/${BRANCH}:${ref}`])
+    if (f.exitCode === 0) {
+      const ls = await git($, bare, ['ls-tree', '-r', ref])
+      for (const line of ls.stdout.split('\n')) {
+        const m = /^100644 blob ([0-9a-f]{40})\tprojects\/[^/]+\/entries\/([\w.-]+\.cloud-[\w-]+\.jsonl)$/.exec(line)
+        if (m) cloud[`projects/${pr.project}/entries/${m[2]}`] = m[1]!
+      }
+    }
+  }
+  for (const [path, blob] of Object.entries(cloud)) now[path] = 'cloud:' + blob
+
   const changed = Object.keys(now).filter(p => sent[p] !== now[p])
-  const gone = Object.keys(sent).filter(p => !(p in now))
+  const gone = Object.keys(sent).filter(p => !(p in now) && !sent[p]!.startsWith('cloud:'))
   if (!changed.length && !gone.length) return 0
 
-  const sealed: Record<string, string> = {}
+  const blobs: Record<string, string> = {}
   for (const path of changed) {
-    const raw = await $.fs.read(`${h}/.branchling/${path}`, { as: 'bytes' })
-    sealed[path] = toBase64(await seal(key, fromBase64(typeof raw === 'string' ? raw : raw.base64))) + '\n'
+    if (cloud[path]) {
+      blobs[path] = cloud[path]!
+      continue
+    }
+    const local = Object.keys(await scanProject($, h, pr.project)).find(l => branchPath(l, gh.device) === path) ?? path
+    const raw = await $.fs.read(`${h}/.branchling/${local}`, { as: 'bytes' })
+    const body = toBase64(await seal(gh.key, fromBase64(typeof raw === 'string' ? raw : raw.base64))) + '\n'
+    const b = await git($, bare, ['hash-object', '-w', '--stdin'], { stdin: body })
+    if (b.exitCode !== 0) throw new Error(`git hash-object: ${b.stderr.trim()}`)
+    blobs[path] = b.stdout.trim()
   }
 
   const env = {
@@ -1039,24 +1089,22 @@ async function pushProject($: EngineInterface, pr: Project): Promise<number> {
   }
   const LOCAL = 'refs/branchling/almanac'
   for (let attempt = 0; attempt < 3; attempt++) {
-    const f = await git($, root, ['fetch', '--quiet', '--no-tags', 'origin', `+refs/heads/${BRANCH}:${LOCAL}`])
+    const f = await git($, bare, ['fetch', '--quiet', '--no-tags', gh.remote, `+refs/heads/${BRANCH}:${LOCAL}`])
     const missing = f.exitCode !== 0 && /couldn't find remote ref|could not find remote ref/i.test(f.stderr)
     if (f.exitCode !== 0 && !missing) throw new Error(`git fetch: ${f.stderr.trim().split('\n').pop()}`)
-    const parent = missing ? '' : (await git($, root, ['rev-parse', LOCAL])).stdout.trim()
-    const rt = await git($, root, parent ? ['read-tree', parent] : ['read-tree', '--empty'], { env })
+    const parent = missing ? '' : (await git($, bare, ['rev-parse', LOCAL])).stdout.trim()
+    const rt = await git($, bare, parent ? ['read-tree', parent] : ['read-tree', '--empty'], { env })
     if (rt.exitCode !== 0) throw new Error(`git read-tree: ${rt.stderr.trim()}`)
-    for (const [path, body] of Object.entries(sealed)) {
-      const b = await git($, root, ['hash-object', '-w', '--stdin'], { stdin: body })
-      const u = await git($, root, ['update-index', '--add', '--cacheinfo', `100644,${b.stdout.trim()},${path}`], { env })
-      if (b.exitCode !== 0 || u.exitCode !== 0) throw new Error(`git: ${(b.stderr || u.stderr).trim()}`)
+    for (const [path, sha] of Object.entries(blobs)) {
+      const u = await git($, bare, ['update-index', '--add', '--cacheinfo', `100644,${sha},${path}`], { env })
+      if (u.exitCode !== 0) throw new Error(`git update-index: ${u.stderr.trim()}`)
     }
-    for (const path of gone) await git($, root, ['update-index', '--force-remove', path], { env })
-    const tree = (await git($, root, ['write-tree'], { env })).stdout.trim()
-    if (parent && (await git($, root, ['rev-parse', `${parent}^{tree}`])).stdout.trim() === tree) break
-    // [skip ci]: a push to this branch must not start the repository's workflows.
-    const c = await git($, root, ['commit-tree', tree, ...(parent ? ['-p', parent] : []), '-m', 'Branchling almanac (sealed) [skip ci]'], { env })
+    for (const path of gone) await git($, bare, ['update-index', '--force-remove', path], { env })
+    const tree = (await git($, bare, ['write-tree'], { env })).stdout.trim()
+    if (parent && (await git($, bare, ['rev-parse', `${parent}^{tree}`])).stdout.trim() === tree) break
+    const c = await git($, bare, ['commit-tree', tree, ...(parent ? ['-p', parent] : []), '-m', 'Branchling almanac (sealed)'], { env })
     if (c.exitCode !== 0) throw new Error(`git commit-tree: ${c.stderr.trim()}`)
-    const p = await git($, root, ['push', '--quiet', '--no-verify', 'origin', `${c.stdout.trim()}:refs/heads/${BRANCH}`])
+    const p = await git($, bare, ['push', '--quiet', '--no-verify', gh.remote, `${c.stdout.trim()}:refs/heads/${BRANCH}`])
     if (p.exitCode === 0) break
     if (attempt === 2 || !/non-fast-forward|fetch first|rejected/i.test(p.stderr)) throw new Error(`git push: ${p.stderr.trim().split('\n').pop()}`)
   }
@@ -1067,11 +1115,8 @@ async function pushProject($: EngineInterface, pr: Project): Promise<number> {
   return changed.length + gone.length
 }
 
-/** A while after the last change, sends this project's almanac to its repository (only when a key is set). */
-const noPush = new Set<string>()
-
+/** A while after the last change, sends this project's almanac to the almanac repository (only when connected). */
 function schedulePush($: EngineInterface, pr: Project) {
-  if (noPush.has(pr.root)) return
   const gen = ++pushGen
   $.clock.after(PUSH_AFTER_MS, async () => {
     if (gen !== pushGen) return
@@ -1079,15 +1124,9 @@ function schedulePush($: EngineInterface, pr: Project) {
       await pushProject($, pr)
       pushWarned = false
     } catch (err) {
-      const msg = String((err as Error)?.message ?? err)
-      // A repository this person may not push to (someone else's clone, a protected branch): leave it out quietly.
-      if (/permission|denied|\b403\b|not allowed|protected branch|read-only/i.test(msg)) {
-        noPush.add(pr.root)
-        return
-      }
       if (!pushWarned) {
         pushWarned = true
-        $.ui.toast(`Branchling could not send the almanac to GitHub (${msg}). It tries again after the next change.`)
+        $.ui.toast(`Branchling could not send the almanac to your almanac repository (${String((err as Error)?.message ?? err)}). It tries again after the next change.`)
       }
     }
   })
@@ -1097,26 +1136,20 @@ async function phoneCommand($: EngineInterface, h: string, rest: string): Promis
   const arg = rest.split(/\s+/)[0] ?? ''
   if (arg === 'off') {
     await $.fs.write(githubFile(h), '{}\n')
-    return 'This computer no longer sends the almanac to your iPhone. What is already on the branchling branch stays until you delete that branch.'
+    return 'This computer no longer sends the almanac to your iPhone. Your almanac repository on GitHub stays as it is until you delete it.'
   }
-  if (arg && KEY_RE.test(arg)) {
-    await $.fs.write(githubFile(h), JSON.stringify({ key: arg }, null, 2) + '\n')
-    const pr = await findProject($, await $.session.cwd())
-    if (!pr) return 'Key saved. Projects you work on here now reach your iPhone through their GitHub repository.'
+  const gh = await githubSetup($, h)
+  if (!gh) return 'Not connected. In Branchling on your iPhone or Mac, open Connect and paste the sentence it shows into Claude Code.'
+  const pr = await findProject($, await $.session.cwd())
+  if (pr && arg === 'now') {
     try {
       const n = await pushProject($, pr)
-      return n
-        ? `Key saved. Sent ${n} sealed file${n === 1 ? '' : 's'} of "${pr.project}" to its branchling branch; it appears on your iPhone in a moment.`
-        : `Key saved. "${pr.project}" has no GitHub remote yet, so it stays on this computer until it has one.`
+      return n ? `Sent ${n} sealed file${n === 1 ? '' : 's'} of "${pr.project}" to ${gh.remote}.` : `"${pr.project}" is up to date in ${gh.remote}.`
     } catch (err) {
-      return `Key saved, but sending failed (${String((err as Error)?.message ?? err)}). It tries again after the next change.`
+      return `Sending failed: ${String((err as Error)?.message ?? err)}`
     }
   }
-  if (arg) return 'That is not a Branchling key. Copy the sentence again from Branchling on your iPhone or Mac.'
-  const key = await sealKey($, h)
-  return key
-    ? 'Connected: each change is sealed with your key and sent to the branchling branch of the project\'s GitHub repository. To stop: /branchling phone off'
-    : 'Not connected. In Branchling on your iPhone or Mac, open Connect Claude Code and paste the sentence it shows here.'
+  return `Connected: every change is sealed with your key and sent to ${gh.remote} (branch ${BRANCH}). Your project repositories are never written to. Send now: /branchling phone now · stop: /branchling phone off`
 }
 
 // ---------- Hooks ----------
@@ -1126,7 +1159,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'branchling',
       description: "This project's almanac: today, goal and plan, open problems, manual entries, linking",
-      argumentHint: '[plan | phone [<key> | off] | off | goal <sentence> | tasks | usage | link <name> | progress|problem|hold <text> | ask <text> | approve <no> | solve <no> <text> | open]',
+      argumentHint: '[plan | phone [now | off] | off | goal <sentence> | tasks | usage | link <name> | progress|problem|hold <text> | ask <text> | approve <no> | solve <no> <text> | open]',
     })
     try {
       await $.tool.register({ name: 'plan', description: PLAN_TOOL_DESC, inputSchema: PLAN_SCHEMA })

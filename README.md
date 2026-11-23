@@ -10,7 +10,7 @@ The plugin is free. The Branchling apps for Mac and iPhone are paid and sold sep
 
 Branchling keeps an almanac of your project while you work in Claude Code. Every test run, build, commit and merge in your git projects becomes a one-line entry, on the branch it happened on, with a small score: progress +1, problem −1, solution +2, a hold 0. Your own Claude keeps the project's goal and plan up to date, and the free plugin works on its own in the terminal. The Branchling app for Mac draws the same almanac as a tree of branches with characters, a road ahead to the goal and a finish forecast.
 
-The plugin has no server and never calls a model by itself: the almanac is a folder of plain JSON lines in `~/.branchling`. Only when you connect the iPhone app does it leave your machine, sealed with a key that only your own devices hold, on a separate `branchling` branch of your own GitHub repository (see [SETUP.md](SETUP.md)).
+The plugin has no server and never calls a model by itself: the almanac is a folder of plain JSON lines in `~/.branchling`. Only when you connect the iPhone app does it leave your machine: sealed with a key that only your own devices hold, into a private repository of your own, `branchling-almanac`. Your project repositories are never written to, and the Branchling app is only allowed to read `branchling-almanac`, never your code (see [SETUP.md](SETUP.md)).
 
 ## Get started
 
@@ -34,7 +34,7 @@ Once a day, at a quiet moment and only when something happened, Claude refreshes
 | `/branchling` | Today's score, open problems and the plan in one glance |
 | `/branchling link <name>` | Names this project's almanac (projects join by themselves) |
 | `/branchling off` | Leaves this project out of the almanac |
-| `/branchling phone [<key> \| off]` | Sends the sealed almanac to your iPhone through GitHub, or stops it |
+| `/branchling phone [now \| off]` | Shows the iPhone connection, sends now, or stops it |
 | `/branchling plan` | Asks Claude to write or refresh the goal and plan |
 | `/branchling goal <sentence>` | Sets the goal yourself (90 characters at most); Claude keeps it |
 | `/branchling tasks` | Lists the planned tasks and their status |
@@ -47,7 +47,7 @@ Once a day, at a quiet moment and only when something happened, Claude refreshes
 
 ## On your iPhone
 
-The Branchling iPhone app shows one sentence. Paste it into Claude Code and Claude sets everything up: on a computer it installs this plugin, in Claude Code on the web it adds a small recorder to the repository. Details in [SETUP.md](SETUP.md).
+The Branchling iPhone app shows one sentence. Paste it into Claude Code and Claude sets everything up: on a computer it installs this plugin and makes the private `branchling-almanac` repository; in Claude Code on the web it adds a small recorder to the repository. Details in [SETUP.md](SETUP.md).
 
 ## Where the data lives
 

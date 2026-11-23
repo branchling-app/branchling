@@ -1,5 +1,5 @@
 {
   "name": "branchling",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Turns what happens in a linked project (tests, builds, commits, merges) into one-line almanac entries: progress +1, problem −1, solution +2, pause 0. Local only, no model calls."
 }

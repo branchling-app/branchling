@@ -3,9 +3,11 @@
 // Lives in the repository as .claude/branchling/record.mjs, run by the hooks in .claude/settings.json:
 //   PostToolUse (Bash)  node .claude/branchling/record.mjs bash   tests, builds, commits and merges become entries
 //   Stop                node .claude/branchling/record.mjs push   seals this session's entries, pushes them
-// The entries are sealed with the public key in .claude/branchling/key.json and pushed to the `branchling` branch of
-// this repository, where only the person's own iPhone and Mac can open them. On a computer with the Branchling
-// plugin the plugin does this work, so the recorder stays quiet there (it only acts when CLAUDE_CODE_REMOTE is true).
+// A cloud session may only push to its own repository, so the sealed entries go to this repository's `branchling`
+// branch; the person's working branches are never touched and the commit says [skip ci]. On their computer the
+// Branchling plugin later copies the sealed files, unopened, into their private `branchling-almanac` repository.
+// The entries are sealed with the public key in .claude/branchling/key.json: only the person's own iPhone and Mac
+// can open them. On a computer the plugin does the recording, so this stays quiet unless CLAUDE_CODE_REMOTE is true.
 // Plain Node, no packages. Sealed format: see plugin/hooks/seal.ts ("BLA1": X25519 + HKDF-SHA256 + ChaCha20-Poly1305).
 
 import { execFileSync, spawnSync } from 'node:child_process'
